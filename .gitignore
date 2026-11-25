@@ -1,0 +1,11 @@
+# Runtime state — large / machine-generated, never tracked
+cache/
+cache-vperf/
+cache-*/
+data/
+proton/
+logs/
+*.log
+victory-perf-good.exe
+press.txt
+research/

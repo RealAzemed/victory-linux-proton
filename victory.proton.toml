@@ -1,0 +1,5 @@
+[paths]
+game_dir  = 'Z:\path\to\title'
+cache_dir = 'Z:\home\$USER\.local\share\ztrx\cache'
+data_dir  = 'Z:\home\$USER\.local\share\ztrx\data'
+test_titles = []

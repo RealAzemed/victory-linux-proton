@@ -404,7 +404,11 @@ impl Hub {
         let (pads, keys) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let mut keys = source.keys();
+            // Scripted input for hands-free test runs (VICTORY_AUTO_INPUT,
+            // VICTORY_PRESS_FILE): keys beside the host's.
+            auto_input_inject(&mut keys);
+            (pads, keys)
         };
         let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
@@ -507,6 +511,89 @@ impl State {
                     .map(|r| r.event(index, now, current, previous)),
             );
         }
+    }
+}
+
+/// VICTORY_PRESS_FILE=<path>: buttons written to that file ("A", "DOWN DOWN A") are held one
+/// after another for 150 ms each, then the file is emptied.
+fn live_press(keys: &mut Vec<KeyState>) {
+    use std::sync::{Mutex, OnceLock};
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    static Q: Mutex<(Option<Instant>, Vec<u8>, Option<Instant>)> = Mutex::new((None, Vec::new(), None));
+    let Some(path) = PATH.get_or_init(|| std::env::var("VICTORY_PRESS_FILE").ok()) else { return };
+    let mut q = Q.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if q.1.is_empty() && q.0.is_none_or(|t| now - t >= Duration::from_millis(50)) {
+        q.0 = Some(now);
+        if let Ok(s) = std::fs::read_to_string(path)
+            && !s.trim().is_empty()
+        {
+            let _ = std::fs::write(path, "");
+            q.1 = s
+                .split_whitespace()
+                .rev()
+                .filter_map(|b| match b.to_ascii_uppercase().as_str() {
+                    "A" => Some(0x0D),
+                    "B" => Some(0x08),
+                    "UP" => Some(0x26),
+                    "DOWN" => Some(0x28),
+                    "LEFT" => Some(0x25),
+                    "RIGHT" => Some(0x27),
+                    "MENU" | "START" => Some(0x1B),
+                    "VIEW" => Some(0x09),
+                    "LS_UP" => Some(b'W'),
+                    "LS_DOWN" => Some(b'S'),
+                    "LS_LEFT" => Some(b'A'),
+                    "LS_RIGHT" => Some(b'D'),
+                    "RS_UP" => Some(b'I'),
+                    "RS_DOWN" => Some(b'K'),
+                    "RS_LEFT" => Some(b'J'),
+                    "RS_RIGHT" => Some(b'L'),
+                    "X" => Some(b'X'),
+                    "Y" => Some(b'Y'),
+                    _ => None,
+                })
+                .collect();
+            q.2 = Some(now);
+        }
+    }
+    let Some(&vk) = q.1.last() else { return };
+    let held = q.2.map_or(Duration::ZERO, |t| now - t);
+    // Stick tokens (LS_*, RS_*) are held 1.5 s, buttons 150 ms.
+    let hold = if b"WASDIJKL".contains(&vk) { 1500 } else { 150 };
+    if held < Duration::from_millis(hold) {
+        keys.push(KeyState { scan_code: 0, code_point: 0, virtual_key: vk, dead_key: false });
+    } else if held >= Duration::from_millis(hold + 150) {
+        q.1.pop();
+        q.2 = Some(now);
+    }
+}
+
+/// VICTORY_FAST_BOOT (testing only): A on every other presented frame, and
+/// START on one frame in eight (skips cutscenes), from the first frame until
+/// VICTORY_AUTO_INPUT: inject A-button presses every ~2 s for the first
+/// 120 s, so menus advance without manual interaction.
+fn auto_input_inject(keys: &mut Vec<KeyState>) {
+    live_press(keys);
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static START: OnceLock<Instant> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_AUTO_INPUT").is_some()) {
+        return;
+    }
+    let start = *START.get_or_init(Instant::now);
+    let elapsed = start.elapsed();
+    if elapsed > Duration::from_secs(120) {
+        return;
+    }
+    let cycle = elapsed.as_millis() % 2000;
+    if cycle < 100 {
+        keys.push(KeyState {
+            scan_code: 0x1C,
+            code_point: 0x0D,
+            virtual_key: 0x0D,
+            dead_key: false,
+        });
     }
 }
 

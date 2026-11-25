@@ -148,7 +148,39 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let mut tried = place_part(&host.device, start, len);
+    // Private memory turned down: why, and (`VICTORY_INPLACE_COMMIT=1`) a
+    // second try once the reserved pages under the window are committed.
+    if matches!(tried, Err(None)) {
+        let at = (start & !(K64 as u64 - 1)) as usize;
+        let bytes = ((start + len.max(1)).next_multiple_of(K64 as u64) - at as u64) as usize;
+        match shape(at, bytes) {
+            Shape::Uncommitted(reserved) => {
+                WHY[1].fetch_add(1, Ordering::Relaxed);
+                WHY_BYTES[1].fetch_add(len, Ordering::Relaxed);
+                if commit_on() && commit(&reserved) {
+                    tried = place_part(&host.device, start, len);
+                    if tried.is_ok() {
+                        WHY[4].fetch_add(1, Ordering::Relaxed);
+                        WHY_BYTES[4].fetch_add(len, Ordering::Relaxed);
+                    }
+                }
+            }
+            Shape::Crosses => {
+                WHY[2].fetch_add(1, Ordering::Relaxed);
+                WHY_BYTES[2].fetch_add(len, Ordering::Relaxed);
+            }
+            Shape::Other => {
+                WHY[3].fetch_add(1, Ordering::Relaxed);
+                WHY_BYTES[3].fetch_add(len, Ordering::Relaxed);
+            }
+            Shape::Whole => {
+                WHY[0].fetch_add(1, Ordering::Relaxed);
+                WHY_BYTES[0].fetch_add(len, Ordering::Relaxed);
+            }
+        }
+    }
+    match tried {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
@@ -166,6 +198,79 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// Of private memory [`place_for`] turned down, by why (count, bytes):
+/// 0 committed whole after all (another reason), 1 some pages only reserved,
+/// 2 the window crosses into another allocation or free memory, 3 another
+/// type or protection; 4 opened after committing the reserved pages.
+static WHY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static WHY_BYTES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// `VICTORY_INPLACE_COMMIT=1`: a window of private memory whose pages are
+/// partly only reserved has them committed, read-write, and is then opened
+/// in place. The window is a 4 MiB cell of the title's address space, often
+/// past what the title committed; the host copy would have had the same
+/// bytes (zeros). Committing takes no memory until a page is touched, but
+/// opening the heap locks every page in (as the copy would have taken them).
+/// shortcut: the title is not told; it may commit those pages itself later
+/// (harmless) or never use them.
+fn commit_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_COMMIT").is_some_and(|v| v == "1"))
+}
+
+/// The pages under `[at, at + bytes)` as `place_part` needs them.
+enum Shape {
+    /// One committed read-write private region.
+    Whole,
+    /// One private allocation, committed read-write where committed; these
+    /// ranges are only reserved.
+    Uncommitted(Vec<(usize, usize)>),
+    /// More than one allocation, or free memory.
+    Crosses,
+    /// Another type or protection.
+    Other,
+}
+
+fn shape(at: usize, bytes: usize) -> Shape {
+    let end = at.saturating_add(bytes);
+    let mut here = at;
+    let mut base = None;
+    let mut reserved = Vec::new();
+    while here < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { mem::VirtualQuery(here as *const c_void, &mut info, size_of_val(&info)) } == 0 {
+            return Shape::Other;
+        }
+        let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if info.State == mem::MEM_FREE || *base.get_or_insert(info.AllocationBase as usize) != info.AllocationBase as usize {
+            return Shape::Crosses;
+        }
+        if info.Type != mem::MEM_PRIVATE {
+            return Shape::Other;
+        }
+        if info.State == mem::MEM_RESERVE {
+            reserved.push((here, region_end - here));
+        } else if info.Protect != mem::PAGE_READWRITE {
+            return Shape::Other;
+        }
+        if region_end <= here {
+            return Shape::Other;
+        }
+        here = region_end;
+    }
+    if reserved.is_empty() { Shape::Whole } else { Shape::Uncommitted(reserved) }
+}
+
+/// Commits the reserved ranges read-write; whether all of them were.
+fn commit(ranges: &[(usize, usize)]) -> bool {
+    ranges.iter().all(|&(at, len)| {
+        // SAFETY: reserved pages of a private allocation of the process.
+        !unsafe { mem::VirtualAlloc(at as *const c_void, len, mem::MEM_COMMIT, mem::PAGE_READWRITE) }.is_null()
+    })
 }
 
 /// What [`place_for`] gave is gone.
@@ -209,6 +314,13 @@ fn say() {
         s[5],
         s[6],
         s[7]
+    );
+    let w: Vec<u64> = WHY.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let b: Vec<u64> = WHY_BYTES.iter().map(|s| s.load(Ordering::Relaxed) >> 20).collect();
+    tracing::info!(
+        "title memory in place, private memory turned down by why: some pages only reserved {} ({} MB), crossing another allocation {} ({} MB), \
+         another type or protection {} ({} MB), other {} ({} MB); opened after committing the reserved pages (VICTORY_INPLACE_COMMIT={}) {} ({} MB)",
+        w[1], b[1], w[2], b[2], w[3], b[3], w[0], b[0], u8::from(commit_on()), w[4], b[4]
     );
 }
 

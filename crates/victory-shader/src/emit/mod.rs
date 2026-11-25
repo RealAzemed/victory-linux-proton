@@ -86,6 +86,7 @@ mod container;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
+pub mod exposure;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
@@ -93,6 +94,7 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+pub mod stand_in;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
@@ -314,11 +316,17 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_code(container, None)
+}
+
+/// [`translate`] with `code` in place of the program's own when given
+/// (the exposure stand-in, [`exposure`]).
+fn translate_code(container: &[u8], code: Option<Vec<u8>>) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -330,6 +338,9 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    if let Some(code) = code {
+        native.code = code;
+    }
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').

@@ -949,6 +949,10 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// While a stand-in is translated on this thread ([`super::stand_in`]):
+    /// the constant bit values written by every `image_store`.
+    pub(super) static STORE_PLAN: std::cell::RefCell<Option<super::stand_in::Plan>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -9600,7 +9604,23 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
+            let slot = match src {
+                Source::Loaded { load, first } => match &self.x.p.blocks[load.0].insts[load.1].fields {
+                    Fields::Smem { offset, .. } => Some(*offset as u32 / 4 + u32::from(*first)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let bits = STORE_PLAN.with(|p| p.borrow_mut().as_mut().map(|p| p.bits(slot)));
+            if let Some(bits) = bits {
+                // A stand-in ([`super::stand_in`]): the value in the
+                // output's own encoding.
+                vals = bits.map(|b| self.s.m.f32(b)).to_vec();
+            }
             for k in 0..4u8 {
+                if vals.len() == 4 {
+                    break;
+                }
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;

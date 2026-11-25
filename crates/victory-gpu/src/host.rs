@@ -142,16 +142,19 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
 
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
-/// when free physical RAM is low. Never returns less than 2,000 ms.
+/// when free physical RAM is low.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
+    const CRITICAL_MS: u64 = 500;
     let Some(avail) = avail_phys else {
         return NORMAL_MS;
     };
-    if avail < 2 * GIB {
+    if avail < GIB {
+        CRITICAL_MS
+    } else if avail < 2 * GIB {
         HIGH_MS
     } else if avail < 4 * GIB {
         MODERATE_MS
@@ -8669,9 +8672,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Moderate (2 GiB..4 GiB)
         assert_eq!(ram_idle_ms(Some(4 * gib - 1)), 5_000);
         assert_eq!(ram_idle_ms(Some(2 * gib)), 5_000);
-        // High (< 2 GiB)
+        // High (1 GiB..2 GiB)
         assert_eq!(ram_idle_ms(Some(2 * gib - 1)), 2_000);
-        assert_eq!(ram_idle_ms(Some(0)), 2_000);
+        assert_eq!(ram_idle_ms(Some(gib)), 2_000);
+        // Critical (< 1 GiB)
+        assert_eq!(ram_idle_ms(Some(gib - 1)), 500);
+        assert_eq!(ram_idle_ms(Some(0)), 500);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
     }

@@ -167,8 +167,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
                 }
             }
             Shape::Crosses => {
-                WHY[2].fetch_add(1, Ordering::Relaxed);
+                let n = WHY[2].fetch_add(1, Ordering::Relaxed);
                 WHY_BYTES[2].fetch_add(len, Ordering::Relaxed);
+                if n < 10 {
+                    log_crosses(at, bytes, window);
+                }
             }
             Shape::Other => {
                 WHY[3].fetch_add(1, Ordering::Relaxed);
@@ -224,10 +227,60 @@ pub(crate) fn note_clamped(bytes: u64) {
     WHY_BYTES[5].fetch_add(bytes, Ordering::Relaxed);
 }
 
+/// Logs the first few `Shape::Crosses` windows' `VirtualQuery` region layout so
+/// we can see whether rejected 4 MiB cells are private allocations, free holes,
+/// or `MEM_MAPPED` views starting past byte 0.
+fn log_crosses(at: usize, bytes: usize, window: bool) {
+    let end = at.saturating_add(bytes);
+    let mut here = at;
+    let mut parts = Vec::new();
+    while here < end && parts.len() < 6 {
+        // SAFETY: plain query into local struct.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { mem::VirtualQuery(here as *const c_void, &mut info, size_of_val(&info)) } == 0 {
+            parts.push(format!("+{:#x}:VQ_FAIL", here - at));
+            break;
+        }
+        let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if region_end <= here {
+            break;
+        }
+        let st = match info.State {
+            mem::MEM_COMMIT => "CMT",
+            mem::MEM_RESERVE => "RSV",
+            mem::MEM_FREE => "FREE",
+            _ => "OTH",
+        };
+        let ty = match info.Type {
+            mem::MEM_PRIVATE => "PRV",
+            mem::MEM_MAPPED => "MAP",
+            mem::MEM_IMAGE => "IMG",
+            _ => "0",
+        };
+        parts.push(format!(
+            "+{:#x}..{:#x} {st}/{ty}/p={:#x}/ab={:#x}",
+            here - at,
+            region_end - at,
+            info.Protect,
+            info.AllocationBase as usize
+        ));
+        here = region_end;
+    }
+    tracing::info!(
+        start = format_args!("{at:#x}"),
+        kb = bytes >> 10,
+        window,
+        regions = %parts.join(", "),
+        "in place sample: crossing another allocation"
+    );
+}
+
 /// If `[address, end)` lies inside a committed RW private `VirtualAlloc`
-/// whose 64 KiB-aligned bounds are strictly narrower than `[start, start+len)`
-/// and the boundaries being clamped are `MEM_FREE` or a different
-/// `AllocationBase`, returns the clamped `(start, len)`.
+/// whose 64 KiB-aligned usable span inside `[start, start+len)` is narrower
+/// than `[start, start+len)`, returns the clamped `(start, len)`.
+/// When `VICTORY_INPLACE_COMMIT=1`, reserved pages belonging to the same
+/// `AllocationBase` within `[start, start+len)` are committed read-write so the
+/// whole private allocation slice inside the cell opens as one in-place heap.
 pub(crate) fn clamp_private_window(address: u64, end: u64, start: u64, len: u64) -> Option<(u64, u64)> {
     if !clamp_on() || len == 0 {
         return None;
@@ -246,33 +299,80 @@ pub(crate) fn clamp_private_window(address: u64, end: u64, start: u64, len: u64)
     {
         return None;
     }
-    let reg_start = (info.BaseAddress as u64).next_multiple_of(K64 as u64);
-    let reg_end = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64) & !(K64 as u64 - 1);
-    if reg_start > address || reg_end < end || reg_end <= reg_start {
-        return None;
-    }
     let win_end = start.saturating_add(len);
-    let cs = start.max(reg_start);
-    let ce = win_end.min(reg_end);
-    if cs == start && ce == win_end {
-        return None;
-    }
-    if cs >= ce {
-        return None;
-    }
-    // Only clamp at real allocation boundaries (MEM_FREE or another AllocationBase),
-    // never splitting a single allocation that has reserved or guarded pages.
-    if cs > start {
-        let mut lo: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let n = unsafe { mem::VirtualQuery((cs - 1) as *const c_void, &mut lo, size_of_val(&lo)) };
-        if n != 0 && lo.State != mem::MEM_FREE && lo.AllocationBase == info.AllocationBase {
-            return None;
+    let alloc_base = info.AllocationBase;
+    let mut reg_start = (info.BaseAddress as u64).max(start);
+    let mut reg_end = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64).min(win_end);
+
+    // Walk forward within the same private allocation inside [start, win_end).
+    // Commit reserved tails when VICTORY_INPLACE_COMMIT=1 so the full slice opens.
+    let mut reserved_to_commit: Vec<(usize, usize)> = Vec::new();
+    let mut cur = reg_end;
+    while cur < win_end {
+        let mut next: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { mem::VirtualQuery(cur as *const c_void, &mut next, size_of_val(&next)) } == 0 {
+            break;
+        }
+        if next.AllocationBase != alloc_base || next.Type != mem::MEM_PRIVATE {
+            break;
+        }
+        let next_end = (next.BaseAddress as u64).saturating_add(next.RegionSize as u64).min(win_end);
+        if next_end <= cur {
+            break;
+        }
+        if next.State == mem::MEM_COMMIT && next.Protect == mem::PAGE_READWRITE {
+            reg_end = next_end;
+            cur = next_end;
+        } else if next.State == mem::MEM_RESERVE && commit_on() {
+            reserved_to_commit.push((cur as usize, (next_end - cur) as usize));
+            reg_end = next_end;
+            cur = next_end;
+        } else {
+            break;
         }
     }
-    if ce < win_end {
-        let mut hi: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let n = unsafe { mem::VirtualQuery(ce as *const c_void, &mut hi, size_of_val(&hi)) };
-        if n != 0 && hi.State != mem::MEM_FREE && hi.AllocationBase == info.AllocationBase {
+    // Walk backward within the same private allocation inside [start, reg_start).
+    while reg_start > start {
+        let mut prev: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { mem::VirtualQuery((reg_start - 1) as *const c_void, &mut prev, size_of_val(&prev)) } == 0 {
+            break;
+        }
+        if prev.AllocationBase != alloc_base || prev.Type != mem::MEM_PRIVATE {
+            break;
+        }
+        let prev_start = (prev.BaseAddress as u64).max(start);
+        if prev_start >= reg_start {
+            break;
+        }
+        if prev.State == mem::MEM_COMMIT && prev.Protect == mem::PAGE_READWRITE {
+            reg_start = prev_start;
+        } else if prev.State == mem::MEM_RESERVE && commit_on() {
+            reserved_to_commit.push((prev_start as usize, (reg_start - prev_start) as usize));
+            reg_start = prev_start;
+        } else {
+            break;
+        }
+    }
+
+    let cs = reg_start.next_multiple_of(K64 as u64);
+    let ce = reg_end & !(K64 as u64 - 1);
+    if cs > address || ce < end || cs >= ce {
+        return None;
+    }
+    if cs == start && ce == win_end && reserved_to_commit.is_empty() {
+        return None;
+    }
+    if !reserved_to_commit.is_empty() {
+        // Clip any reserved commit ranges to [cs, ce) and commit them RW.
+        let clipped: Vec<(usize, usize)> = reserved_to_commit
+            .into_iter()
+            .filter_map(|(a, n)| {
+                let lo = a.max(cs as usize);
+                let hi = a.saturating_add(n).min(ce as usize);
+                (hi > lo).then_some((lo, hi - lo))
+            })
+            .collect();
+        if !clipped.is_empty() && !commit(&clipped) {
             return None;
         }
     }

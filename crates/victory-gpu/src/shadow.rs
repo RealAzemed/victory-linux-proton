@@ -3703,10 +3703,44 @@ fn holder(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u64) -> 
         .max_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
 }
 
+/// Whether sparse non-in-place loose windows use a hybrid fine grid + root-view
+/// tails (`VICTORY_HYBRID_WINDOWS=1`), while private in-place windows keep the
+/// full 4 MiB cell.
+///
+/// On 16 GB RAM systems, `VICTORY_INPLACE=1` opens private 4 MiB windows with
+/// zero pinned RAM, while 800-1,200 sparse view-memory cells (which hold small
+/// scattered 64 KiB `MEM_MAPPED` views after 0.8-2.8 MiB leading `MEM_RESERVE`
+/// holes) fall back to 4 MiB pinned host buffers (~4-5.4 GB of unswappable
+/// `/dev/nvidiactl` RAM). Setting a global small grid (`VICTORY_WINDOW_KB=512`)
+/// hurts because it also fragments private in-place coverage (340 -> 151 MB).
+/// Hybrid sizing keeps full 4 MiB in-place coverage for private memory and
+/// shrinks ONLY non-in-place fallback allocations (`VICTORY_HYBRID_WINDOW_KB`,
+/// default 512 KiB for sized asks; `tail_of` on 256 KiB steps for unsized root
+/// views, cutting out leading reserved holes).
+fn hybrid_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HYBRID_WINDOWS").is_some_and(|v| v == "1"))
+}
+
+fn hybrid_grid() -> u64 {
+    static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *GRID.get_or_init(|| {
+        let kb = std::env::var("VICTORY_HYBRID_WINDOW_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(512);
+        grid(Some(kb))
+    })
+}
+
+/// Hybrid fallback windows allocated, bytes allocated, and pinned RAM bytes
+/// saved relative to 4 MiB cells (logged periodically).
+static HYBRID_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Whether windows may be smaller than their 4 MiB cell (a finer grid, or
-/// tails): only then is there more than one window to choose from.
+/// tails, or hybrid fallback): only then is there more than one window to choose from.
 fn fine() -> bool {
-    tails() || window() < WINDOW
+    tails() || window() < WINDOW || hybrid_windows()
 }
 
 /// For the memory line: the bytes of title memory the windows alive lie
@@ -3750,7 +3784,115 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    let (cell, _) = window_of(address, end, WINDOW);
+    let (cell, cell_len) = window_of(address, end, WINDOW);
+    // Under the lock, with the handing out: see `let_go_idle`.
+    let note = |shadow: &Shadow| {
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        if unsized_ask {
+            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    let hybrid = hybrid_windows();
+    if hybrid {
+        // 1. Reuse any existing in-place window (full 4 MiB or clamped private)
+        // covering [address, end): preserves 100% of private in-place coverage.
+        if let Some(shadow) = map.get(&(cell, cell_len))
+            && shadow.place.is_some()
+        {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        if let Some(key) = holder(there, address, end)
+            && let Some(shadow) = map.get(&key)
+            && shadow.place.is_some()
+        {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        // 2. Compute hybrid fallback window for sparse non-in-place view memory
+        // and check if an existing fallback window already covers this ask.
+        let (fb_start, fb_len) = if unsized_ask {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+        } else if any {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            holder(there, address, end).unwrap_or_else(|| window_of(address, end, hybrid_grid()))
+        } else {
+            window_of(address, end, hybrid_grid())
+        };
+        if let Some(shadow) = map.get(&(fb_start, fb_len)) {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        // 3. Cache miss: try opening the full 4 MiB private cell (or clamped
+        // private allocation) in place FIRST. Skip if the ask is already known
+        // to lie in view memory (avoids wasted VirtualQuery work).
+        if crate::inplace::cover(address as usize, end.saturating_sub(address).max(1) as usize)
+            == crate::inplace::Cover::None
+        {
+            let (place_start, place_len, clamped) =
+                match crate::inplace::clamp_private_window(address, end, cell, cell_len) {
+                    Some((cs, cl)) => (cs, cl, true),
+                    None => (cell, cell_len, false),
+                };
+            if let Some(placed) = crate::inplace::place_for(place_start, place_len, true) {
+                if clamped {
+                    crate::inplace::note_clamped(place_len);
+                }
+                let shadow = Arc::new(Shadow::placed(placed, place_start, place_len, true));
+                note(&shadow);
+                map.insert((place_start, place_len), shadow.clone());
+                return Some(shadow);
+            }
+        }
+        // 4. Fallback to pinned host buffer sized to (fb_start, fb_len) instead
+        // of wasting a full 4 MiB buffer on leading reserved holes.
+        let (start, len) = (fb_start, fb_len);
+        let (buffer, data) = host()?.shared_buffer(len)?;
+        let n = HYBRID_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let alloc = HYBRID_STATS[1].fetch_add(len, Ordering::Relaxed) + len;
+        let saved = HYBRID_STATS[2].fetch_add(cell_len.saturating_sub(len), Ordering::Relaxed)
+            + cell_len.saturating_sub(len);
+        if n == 1 || n.is_multiple_of(256) {
+            tracing::info!(
+                windows = n,
+                alloc_mb = alloc >> 20,
+                saved_mb = saved >> 20,
+                grid_kb = hybrid_grid() >> 10,
+                "hybrid sparse-view windows (VICTORY_HYBRID_WINDOWS=1): pinned RAM saved vs 4 MiB cells"
+            );
+        }
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+        let (buffer, card) = match window_card_for(len) {
+            Some(on_card) => {
+                crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+                let card = Card {
+                    staging: buffer,
+                    before: Mutex::default(),
+                    dirty: Mutex::default(),
+                    sent: Mutex::default(),
+                    size: len,
+                };
+                (on_card, Some(card))
+            }
+            None => (buffer, None),
+        };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+        shadow.window = true;
+        shadow.card = card;
+        let shadow = Arc::new(shadow);
+        if shadow.card.is_some() {
+            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        }
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
@@ -3763,15 +3905,6 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         holder(there, address, end).unwrap_or(named)
     } else {
         named
-    };
-    // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
     };
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);

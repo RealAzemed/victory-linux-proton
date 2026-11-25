@@ -7555,7 +7555,7 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+const BUFFERS: u32 = 3;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
@@ -8000,7 +8000,22 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            static VSYNC: OnceLock<u32> = OnceLock::new();
+            let sync = *VSYNC.get_or_init(|| {
+                u32::from(std::env::var_os("VICTORY_VSYNC").is_some_and(|v| v == "1"))
+            });
+            let hr = p.swap_chain.Present(sync, DXGI_PRESENT(0));
+            if hr.is_err() {
+                static ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 10 || n.is_multiple_of(300) {
+                    tracing::warn!(
+                        hr = format_args!("{:#x}", hr.0 as u32),
+                        errors = n,
+                        "swap chain Present failed"
+                    );
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

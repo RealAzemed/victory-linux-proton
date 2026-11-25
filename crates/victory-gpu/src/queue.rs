@@ -1384,7 +1384,20 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // A second plane (the title's interface over its game image, in
+        // its Series S mode) is drawn over the first: `crate::over`.
+        const READABLE: u32 = 0x80;
+        // SAFETY: the title passes `planes` plane descriptions.
+        let second = unsafe { second_plane(planes, plane_parameters, resource) }
+            .and_then(|r| Some((r, crate::resource::host_resource(r)?)));
+        let over = second.map(|(r, t)| {
+            let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
+            (r, t, was)
+        });
+        let shown = host.present(texture, state, frame, over.map(|(_, t, was)| (t, was)));
+        if let Some((r, _, was)) = over {
+            crate::resource::host_transition(r, was);
+        }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
@@ -1394,6 +1407,31 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
+}
+
+/// The bytes from one plane's description to the next in a present.
+#[cfg(windows)]
+const PLANE_STRIDE: usize = 0x48;
+
+/// The first resource of a present's second plane, if it has one that is not
+/// the first plane's (`first`): what is drawn over the first.
+///
+/// # Safety
+/// `parameters` is null or points at `planes` plane descriptions,
+/// [`PLANE_STRIDE`] bytes apart, each listing `count` resources.
+#[cfg(windows)]
+unsafe fn second_plane(planes: u32, parameters: *const Plane, first: This) -> Option<This> {
+    if planes < 2 || parameters.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's: a second description follows the first.
+    let plane = unsafe { &*parameters.cast::<u8>().add(PLANE_STRIDE).cast::<Plane>() };
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    (!resource.is_null() && resource != first).then_some(resource)
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.

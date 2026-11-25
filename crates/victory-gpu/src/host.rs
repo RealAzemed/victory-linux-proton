@@ -8472,7 +8472,7 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+const BUFFERS: u32 = 3;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
@@ -8925,10 +8925,14 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            static VSYNC: OnceLock<u32> = OnceLock::new();
+            let sync = *VSYNC.get_or_init(|| {
+                u32::from(std::env::var_os("VICTORY_VSYNC").is_some_and(|v| v == "1"))
+            });
             // What Present answers was thrown away: a removal it is the
             // first to report then looked as if the next call found it.
             // Said once (a status that is no error, as "occluded", is not).
-            let shown = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let shown = p.swap_chain.Present(sync, DXGI_PRESENT(0));
             if shown.is_err() {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {

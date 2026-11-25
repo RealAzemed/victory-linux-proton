@@ -16,26 +16,78 @@ All measurements below were captured on:
 
 ## What This Fork Does That Others Don’t
 
-### 1. Hybrid In-Place + Sparse-View Window Sizing (`VICTORY_HYBRID_WINDOWS=1`)
-**Problem**: On 16 GB machines, `shadow.rs` allocates 4 MiB pinned host buffers
-(`/dev/nvidiactl`, unswappable) for every loose window outside registered title
-buffers. Profiling `Shape::Crosses` rejections on Linux revealed that nearly
-every rejected 4 MiB cell (~800–1,200 windows, **4–5.4 GB of pinned RAM**) is a
-sparse `xmem` virtual placeholder with **0.8–2.8 MiB of leading `MEM_RESERVE`
-dead holes** before a handful of 64 KiB `MEM_MAPPED` views. Setting a global
-small window grid (`VICTORY_WINDOW_KB=512`) regresses performance because it
-also fragments private `VICTORY_INPLACE=1` windows (cutting in-place coverage
-from ~370 MB down to ~151 MB).
+### 1. Userspace `xmem` Placeholder & View-Region Fast Path (`VICTORY_PLACEHOLDER_FAST=1`)
+**Problem**: Console physical-page views live inside ~23 `MEM_RESERVE_PLACEHOLDER`
+virtual reservations (`xmem.rs`). On Wine/Proton, every `GetWriteWatch`,
+`VirtualQuery`, and failing `VirtualProtect` against placeholder memory crosses
+into ntdll’s VMA tree / wineserver — burning **~12,600 wasted Wine syscalls per
+frame** across `watch::writes()`, `watch::guard()` absent-block probing,
+`watch::protect_here()`, and `texture.rs::{committed, mapped_bytes}()`.
 
-**Our solution** ([`crates/victory-gpu/src/shadow.rs`](../crates/victory-gpu/src/shadow.rs)):
-- Keeps full **4 MiB cells** for private `OpenExistingHeapFromAddress1` in-place
-  windows (preserving 100% of zero-copy private coverage).
-- Shrinks **only** non-in-place sparse view fallbacks to `VICTORY_HYBRID_WINDOW_KB`
-  (default **512 KiB**) for sized asks and 256 KiB-aligned `tail_of` windows for
-  unsized root views—eliminating the 0.8–2.8 MiB leading reserved dead zones
-  from unswappable pinned RAM and cutting unmapped-page copy faults.
+**Our solution** ([`crates/victory-hle/src/modules/xmem.rs`](../crates/victory-hle/src/modules/xmem.rs),
+[`crates/victory-gpu/src/inplace.rs`](../crates/victory-gpu/src/inplace.rs),
+[`crates/victory-gpu/src/watch.rs`](../crates/victory-gpu/src/watch.rs),
+[`crates/victory-gpu/src/texture.rs`](../crates/victory-gpu/src/texture.rs)):
+- Registers `MEM_RESERVE_PLACEHOLDER` reservations once at `XMemVirtualAlloc`
+  via `victory_gpu::title_memory_placeholder(base, size)` into a lock-light
+  `RwLock<BTreeMap<usize, usize>>`.
+- `watch::writes(..., false)` returns `None` immediately in userspace for
+  placeholders (skipping doomed `GetWriteWatch` syscalls).
+- `watch::guard()` recognizes placeholder ranges without `GetWriteWatch` or
+  `VirtualQuery`, skips `uncommitted_end()` queries on absent blocks (which
+  only become mapped via `xmem::map` → `title_memory_remapped`), and
+  `protect_here()` marks unmapped gaps directly from `VIEWS` while only
+  calling `VirtualProtect` on contiguous mapped runs.
+- `watch::protect()` looks up aliased pages across `[from, to)` in a single
+  `VIEWS` lock (`aliased_pages_in`) instead of locking per 64 KiB block.
+- `texture.rs::{committed, mapped_bytes}()` answer directly from the userspace
+  `VIEWS` map inside placeholders (0 syscalls), slashing `heap_tex_pass`
+  **107.8 ms → 22.8–38.6 ms (−79%)** and `copies` **243.6 ms → 115–127 ms (−53%)**.
 
-### 2. Full-Allocation Private In-Place Clamping & Reserved-Tail Commit (`VICTORY_INPLACE_CLAMP=1`)
+### 2. 64-Block Bitset `BlockSet` & Same-Frame Adaptive Hot-Block Unguarding (`VICTORY_HOT_GUARD=1`)
+**Problem**: `watch::Guards` tracked every 64 KiB block in per-block
+`BTreeSet<usize>` trees (~200,000 entries), taking `19–61 ms/frame` just to
+walk ranges, while dynamic ring/constant blocks written multiple times per
+frame triggered `675–960` `VirtualProtect(PAGE_READONLY)` calls/frame
+(`64–104 ms/frame` + cross-CPU TLB shootdowns + `SIGSEGV` VEH page faults on
+the title’s own CPU threads).
+
+**Our solution** ([`crates/victory-gpu/src/watch.rs`](../crates/victory-gpu/src/watch.rs)):
+- Replaces `protected`, `clean`, `absent`, `viewed` with a compact `BlockSet`
+  (`BTreeMap<usize, u64>`, 64 blocks = 4 MiB per `u64` word), turning `guard()`
+  into an O(words) bitwise `!(clean | absent)` + `trailing_zeros()` scan with
+  zero heap allocations and coalescing contiguous `VirtualProtect` runs in
+  `open_here()`.
+- Tracks same-frame write faults in the VEH handler: blocks faulting `>= 4`
+  times within the *same* frame are left `PAGE_READWRITE` for a short bounded
+  cooldown (`4 → 8` frames, then re-probed). Strictly conservative (`guard()`
+  always reports them written so copies stay 100% fresh), cutting `guard_scan`
+  to **`8.8 ms`**, `guard_prot` to **`36.5 ms / 425 vp`**, and total `watch`
+  to **`41.1 ms`**.
+
+### 3. Zero-Latency Character Bake Texture Flush & 8 GB VRAM `bake_room()`
+**Problem**: On 8 GB GPUs, regular textures filled VRAM to 94–99% before
+one-time `PS_BakeDecorations_*` character bakes ran, AND DirectStorage writes
+into physical pages (`PAGE_WRITTEN`) were either ignored (default
+`VICTORY_PAGE_WRITES=guards`) or delayed by 1–2 frames (`frame + 1` /
+`frame + PAGE_WRITE_AFTER`) — causing `PS_BakeDecorations_*` to permanently
+bake `#000000` zeros onto character faces and leave hair pale.
+
+**Our solution** ([`crates/victory-gpu/src/resource.rs`](../crates/victory-gpu/src/resource.rs),
+[`crates/victory-gpu/src/descriptor/host.rs`](../crates/victory-gpu/src/descriptor/host.rs),
+[`crates/victory-gpu/src/draw.rs`](../crates/victory-gpu/src/draw.rs)):
+- Adds `resource::bake_room()` (`used < 97%` of DXGI budget, ignoring long-term
+  `card_room_kept()`/`targets_room_kept()` reserves during one-time bakes)
+  paired with `VICTORY_TEXTURE_ROOM_PERCENT=88` to preserve ~650 MiB of bake
+  headroom on 8 GB GPUs.
+- Retains recent DirectStorage page-write ranges (`BAKE_PAGE_WRITTEN`) when
+  continuous bit-2 re-uploads are off, and flushes `REMAPPED`, `PAGE_WRITTEN`,
+  and recently-uploaded/partially-mapped queue slots (`texture_slots_bake_prepare`)
+  with **0-frame delay (`due = frame`)** right before `PS_BakeDecorations_*`
+  draws — fixing character face skin and dark hair without flooding mid-game
+  streaming.
+
+### 4. Full-Allocation Private In-Place Clamping & Reserved-Tail Commit (`VICTORY_INPLACE_CLAMP=1`)
 **Problem**: Fixed 4 MiB loose windows that straddle a private `VirtualAlloc`
 boundary or contain trailing `MEM_RESERVE` pages fail `private_whole()` and
 fall back to pinned host copies.
@@ -46,7 +98,7 @@ fall back to pinned host copies.
   and clamping to 64 KiB-aligned usable boundaries so `OpenExistingHeapFromAddress1`
   opens the whole private slice in place.
 
-### 3. Wine/Proton IPC Elimination: `VICTORY_WRITE_PLAIN=1`, `VICTORY_COPY_PLAIN_MIN=4`, & `VirtualQuery` Page Probing
+### 5. Wine/Proton IPC Elimination: `VICTORY_WRITE_PLAIN=1`, `VICTORY_COPY_PLAIN_MIN=4`, & `VirtualQuery` Page Probing
 **Problem**: On native Windows, `ReadProcessMemory` and `NtWriteVirtualMemory`
 are fast syscalls, whereas `VirtualQuery` walks page tables slowly. On
 Linux/Wine/Proton, the cost profile is **inverted**:
@@ -74,13 +126,13 @@ Linux/Wine/Proton, the cost profile is **inverted**:
   Combined with `VICTORY_COMMITTED_QUERY=1`, `heap_textures` dropped from
   **627–1,016 ms → 8–44 ms (−94%)**.
 
-### 4. Critical-RAM Eviction Tier (`< 1 GiB → 500 ms`)
+### 6. Critical-RAM Eviction Tier (`< 1 GiB → 500 ms`)
 In [`crates/victory-gpu/src/host.rs`](../crates/victory-gpu/src/host.rs),
 `ram_idle_ms()` adds a `< 1 GiB → 500 ms` reclaim tier (4× faster than the
 2,000 ms floor) so idle loose windows, staging buffers, and unused host
 textures are released aggressively before 16 GB systems thrash swap.
 
-### 5. Linux/Proton & Series S Compatibility + Cross-Fork Visual Fixes
+### 7. Linux/Proton & Series S Compatibility + Cross-Fork Visual Fixes
 - **MinGW cross-build (`cargo win`) + `vkd3d-proton` fixes**: null-blob
   `CreatePipelineLibrary` fix, integer render-target blending stripped
   (`pipeline/host.rs`, eliminating `vkd3d-proton` `E_INVALIDARG` rejections on
@@ -107,4 +159,9 @@ textures are released aggressively before 16 GB systems thrash swap.
 | + In-place (`164535`) | `VICTORY_INPLACE=1` (340 MB in place) | `1.10` | `915 ms` | `— / 180 ms` | ~850 | — |
 | `fork-opt-v1` (`193355`) | Rebase `0b0074e`, `COPY_PLAIN_MIN=4`, `WRITE_PLAIN=1` | `1.20` (12.8 peak) | `816 ms` | `426 / 74 ms` | ~900 | `627–1,016 ms` |
 | `fork-opt-v2` (`221031`) | Rebase `465b94f`, integer-blend fix, depth-shaded `ambient.rs`, `COMMITTED_QUERY=1`, `lz4` zram | `1.20` (2.0 non-swap) | `831 ms` (430–533 non-swap) | `432 / 56 ms` | `1,490` (164 new PSOs compiling) | `31–44 ms` |
-| `fork-opt-v3` (`223759`) | All 164 PSOs warm, `INPLACE_CLAMP`, 500 ms RAM sweep, `LIBRARY_TRIM=1`, `CARD_WINDOWS_MB=0` | **`1.35`** | **`733 ms`** | **`339 / 56 ms`** | **`2,018`** | **`8–44 ms`** |
+| `fork-opt-v3` (`223759`) | All 164 PSOs warm, `INPLACE_CLAMP`, 500 ms RAM sweep, `LIBRARY_TRIM=1`, `CARD_WINDOWS_MB=0` | `1.35` (2.0 peak) | `733 ms` | `339 / 56 ms` | `2,018` | `8–44 ms` |
+| `fork-opt-v5` (`231530`) | `VICTORY_PLACEHOLDER_FAST=1` (~12.6k syscalls/frame skipped), `CARD_REHASH_RUNS=1` (−91% passes) | `1.60` (3.4 peak) | `629 ms` | `212 / 48 ms` | `~1,800` | `22.8 ms` |
+| `fork-opt-v7` (`235753`) | `BlockSet` 64-block bitset, `HOT_GUARD=1`, immediate bake flush (Lucia/cop faces & dark hair fixed!) | `1.40` (**8.3** / 11 peak) | `738 ms` | `296 / 56 ms` | `1,342` | `~38 ms` |
+| **`fork-opt-v8` (`001058`)** | Retained `BAKE_PAGE_WRITTEN`, same-frame `HOT_GUARD=1`, `TEXTURE_ROOM_PERCENT=88` + `bake_room()` | **`1.75`** (2.5 peak) | **`566 ms`** | **`193 / 31 ms`** | **`2,067`** | **`38.6 ms`** |
+
+*(Note: `VICTORY_HYBRID_WINDOWS=1` was tested in `fork-opt-v4` and disabled by default — overlapping 512 KiB/tail windows inside a 4 MiB cell saved ~2 GB swap but tripled `copies` and caused stalls; `VICTORY_WIDE_REFRESH=1` was tested in `fork-opt-v6` and disabled by default due to `JOURNAL`/`GUARDS` mutex contention and `WORKERS` pool collision with `relay_worker`.)*

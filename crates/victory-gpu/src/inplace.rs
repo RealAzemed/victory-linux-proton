@@ -459,11 +459,69 @@ pub(crate) fn gone(window: bool, bytes: u64, section: bool) {
 /// Whether committed physical-page sections (`SEC_COMMIT`, as `xmem` makes on
 /// Wine/Proton) are opened once via `OpenExistingHeapFromFileMapping` so
 /// contiguous view-memory windows outside buffers are placed directly over the
-/// section with 0 pinned RAM, 0 working-set lock, 0 copies, and 0 guards
-/// (`VICTORY_INPLACE_SECTIONS=0` disables; on by default when `VICTORY_INPLACE>=1`).
+/// section with 0 pinned RAM, 0 working-set lock, 0 copies, and 0 guards.
+///
+/// Opt-in (`VICTORY_INPLACE_SECTIONS=1`) and strictly gated on synchronous
+/// completion (`!VICTORY_LATE_WAIT && !VICTORY_RELAY`): because `Shadow::placed`
+/// skips `Shadow::gpu_writes`, allowing section windows while flights fly ahead
+/// would let the CPU observe stale bytes before a shader write lands (#358).
+/// Also requires a one-time CPU<->GPU aliasing round-trip check
+/// (`section_reads && section_writes && section_outlives_views`) to reject
+/// drivers/wrappers (such as stock libdrm/RADV under vkd3d-proton) where
+/// `OpenExistingHeapFromFileMapping` silently falls back to non-aliasing private
+/// memory while still returning `S_OK`.
 pub(crate) fn section_windows_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    level() >= 1 && *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_SECTIONS").is_none_or(|v| v != "0"))
+    level() >= 1
+        && *ON.get_or_init(|| {
+            let asked = std::env::var_os("VICTORY_INPLACE_SECTIONS").is_some_and(|v| v == "1");
+            if !asked {
+                return false;
+            }
+            if crate::host::late() || crate::host::relay() {
+                tracing::warn!(
+                    late = crate::host::late(),
+                    relay = crate::host::relay(),
+                    "VICTORY_INPLACE_SECTIONS=1 refused while VICTORY_LATE_WAIT or VICTORY_RELAY is active: placed windows do not track flight shader writes"
+                );
+                return false;
+            }
+            true
+        })
+}
+
+/// One-time live CPU<->GPU aliasing round-trip verification for
+/// `OpenExistingHeapFromFileMapping` (cached per process). Catches drivers or
+/// Wine/vkd3d-proton backends (e.g. stock libdrm/RADV with `ANONONLY`) where
+/// opening a file mapping returns `S_OK` on a separate non-aliasing buffer.
+fn section_aliasing_verified(device: &ID3D12Device) -> bool {
+    static VERIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFIED.get_or_init(|| {
+        let Ok(mut rig) = Rig::new(device) else {
+            tracing::warn!("section-heap aliasing self-test skipped (no test queue): falling back to copies");
+            return false;
+        };
+        let mut p = Probe::default();
+        // SAFETY: `section()` allocates and cleans up its own temporary section, placeholder, and views.
+        unsafe { section(&mut p, &mut rig) };
+        let ok = p.section_reads && p.section_writes && p.section_outlives_views;
+        if ok {
+            tracing::info!(
+                section_reads = p.section_reads,
+                section_writes = p.section_writes,
+                section_outlives_views = p.section_outlives_views,
+                "verified OpenExistingHeapFromFileMapping CPU<->GPU aliasing for VICTORY_INPLACE_SECTIONS=1"
+            );
+        } else {
+            tracing::warn!(
+                section_reads = p.section_reads,
+                section_writes = p.section_writes,
+                section_outlives_views = p.section_outlives_views,
+                "OpenExistingHeapFromFileMapping failed CPU<->GPU aliasing check: disabling VICTORY_INPLACE_SECTIONS"
+            );
+        }
+        ok
+    })
 }
 
 /// Section-heap in-place windows: [0] live count, [1] live bytes, [2] total
@@ -585,6 +643,9 @@ pub(crate) fn place_section_window(
         )?
     };
     let host = crate::host::host()?;
+    if !section_aliasing_verified(&host.device) {
+        return None;
+    }
     let heap = {
         let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         let map = heaps.get_or_insert_with(Default::default);

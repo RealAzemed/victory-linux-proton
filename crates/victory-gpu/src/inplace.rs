@@ -203,9 +203,81 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 /// Of private memory [`place_for`] turned down, by why (count, bytes):
 /// 0 committed whole after all (another reason), 1 some pages only reserved,
 /// 2 the window crosses into another allocation or free memory, 3 another
-/// type or protection; 4 opened after committing the reserved pages.
-static WHY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-static WHY_BYTES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// type or protection; 4 opened after committing the reserved pages;
+/// 5 opened after clamping a 4 MiB window to its VirtualAlloc boundary.
+static WHY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static WHY_BYTES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// `VICTORY_INPLACE_CLAMP`: on by default when `VICTORY_INPLACE >= 1` (`=0`
+/// turns it off). When a fixed 4 MiB loose window sticks out past a private
+/// committed `VirtualAlloc` into `MEM_FREE` or another allocation, clamping
+/// the window to the 64 KiB-aligned allocation boundary lets
+/// `OpenExistingHeapFromAddress1` open it in place instead of allocating a
+/// 4 MiB pinned host buffer and copying pages every frame.
+pub(crate) fn clamp_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    level() >= 1 && *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_CLAMP").is_none_or(|v| v != "0"))
+}
+
+pub(crate) fn note_clamped(bytes: u64) {
+    WHY[5].fetch_add(1, Ordering::Relaxed);
+    WHY_BYTES[5].fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// If `[address, end)` lies inside a committed RW private `VirtualAlloc`
+/// whose 64 KiB-aligned bounds are strictly narrower than `[start, start+len)`
+/// and the boundaries being clamped are `MEM_FREE` or a different
+/// `AllocationBase`, returns the clamped `(start, len)`.
+pub(crate) fn clamp_private_window(address: u64, end: u64, start: u64, len: u64) -> Option<(u64, u64)> {
+    if !clamp_on() || len == 0 {
+        return None;
+    }
+    if cover(address as usize, end.saturating_sub(address).max(1) as usize) != Cover::None {
+        return None;
+    }
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: plain query into local struct.
+    if unsafe { mem::VirtualQuery(address as *const c_void, &mut info, size_of_val(&info)) } == 0 {
+        return None;
+    }
+    if info.State != mem::MEM_COMMIT
+        || info.Type != mem::MEM_PRIVATE
+        || info.Protect != mem::PAGE_READWRITE
+    {
+        return None;
+    }
+    let reg_start = (info.BaseAddress as u64).next_multiple_of(K64 as u64);
+    let reg_end = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64) & !(K64 as u64 - 1);
+    if reg_start > address || reg_end < end || reg_end <= reg_start {
+        return None;
+    }
+    let win_end = start.saturating_add(len);
+    let cs = start.max(reg_start);
+    let ce = win_end.min(reg_end);
+    if cs == start && ce == win_end {
+        return None;
+    }
+    if cs >= ce {
+        return None;
+    }
+    // Only clamp at real allocation boundaries (MEM_FREE or another AllocationBase),
+    // never splitting a single allocation that has reserved or guarded pages.
+    if cs > start {
+        let mut lo: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { mem::VirtualQuery((cs - 1) as *const c_void, &mut lo, size_of_val(&lo)) };
+        if n != 0 && lo.State != mem::MEM_FREE && lo.AllocationBase == info.AllocationBase {
+            return None;
+        }
+    }
+    if ce < win_end {
+        let mut hi: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { mem::VirtualQuery(ce as *const c_void, &mut hi, size_of_val(&hi)) };
+        if n != 0 && hi.State != mem::MEM_FREE && hi.AllocationBase == info.AllocationBase {
+            return None;
+        }
+    }
+    Some((cs, ce - cs))
+}
 
 /// `VICTORY_INPLACE_COMMIT=1`: a window of private memory whose pages are
 /// partly only reserved has them committed, read-write, and is then opened
@@ -319,8 +391,9 @@ fn say() {
     let b: Vec<u64> = WHY_BYTES.iter().map(|s| s.load(Ordering::Relaxed) >> 20).collect();
     tracing::info!(
         "title memory in place, private memory turned down by why: some pages only reserved {} ({} MB), crossing another allocation {} ({} MB), \
-         another type or protection {} ({} MB), other {} ({} MB); opened after committing the reserved pages (VICTORY_INPLACE_COMMIT={}) {} ({} MB)",
-        w[1], b[1], w[2], b[2], w[3], b[3], w[0], b[0], u8::from(commit_on()), w[4], b[4]
+         another type or protection {} ({} MB), other {} ({} MB); opened after committing reserved (VICTORY_INPLACE_COMMIT={}) {} ({} MB), \
+         after clamping to allocation (VICTORY_INPLACE_CLAMP={}) {} ({} MB)",
+        w[1], b[1], w[2], b[2], w[3], b[3], w[0], b[0], u8::from(commit_on()), w[4], b[4], u8::from(clamp_on()), w[5], b[5]
     );
 }
 

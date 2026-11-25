@@ -3777,12 +3777,35 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(shadow);
         return Some(shadow.clone());
     }
+    // Check for an already-opened in-place window clamped to an allocation
+    // boundary inside this 4 MiB cell (O(log N), zero syscalls on hits).
+    if crate::inplace::clamp_on() {
+        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        if let Some(key) = holder(there, address, end)
+            && let Some(shadow) = map.get(&key)
+            && shadow.place.is_some()
+        {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+    }
     // In place, if asked for and the window's memory can be opened: the
-    // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+    // window is the title's own memory, with nothing to copy. If a 4 MiB
+    // window would stick out past a private VirtualAlloc boundary, clamp it
+    // to that allocation's 64 KiB-aligned extent so OpenExistingHeapFromAddress1
+    // can open it in place instead of copying a 4 MiB host buffer.
+    let (place_start, place_len, clamped) =
+        match crate::inplace::clamp_private_window(address, end, start, len) {
+            Some((cs, cl)) => (cs, cl, true),
+            None => (start, len, false),
+        };
+    if let Some(placed) = crate::inplace::place_for(place_start, place_len, true) {
+        if clamped {
+            crate::inplace::note_clamped(place_len);
+        }
+        let shadow = Arc::new(Shadow::placed(placed, place_start, place_len, true));
         note(&shadow);
-        map.insert((start, len), shadow.clone());
+        map.insert((place_start, place_len), shadow.clone());
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;

@@ -622,6 +622,11 @@ fn known_view(start: usize) -> bool {
         return false;
     }
     let first = start / BLOCK;
+    // Userspace placeholder check: memory inside an xmem placeholder reservation
+    // is never write-watched (zero lock, zero syscall).
+    if crate::inplace::is_placeholder(start) {
+        return true;
+    }
     // The light refresh: a block known by its bit is read-only by our hand
     // or a hole the guards noted, which is what they are asked below.
     if light() && PUBLISHED.all(first, first + 1) {
@@ -657,6 +662,30 @@ struct Guards {
     /// others are answered from their notes, which then grow old
     /// ([`note_life`]).
     holes: BTreeSet<usize>,
+    /// With `VICTORY_HOT_GUARD=1`: write-fault count per block in `fault_frame`.
+    /// Blocks faulting >= HOT_FAULTS times in one frame stay read-write for the
+    /// remainder of that frame instead of thrashing VirtualProtect + VEH faults.
+    fault_frame: u64,
+    faults: BTreeMap<usize, u16>,
+    hot: BTreeSet<usize>,
+}
+
+/// Threshold of write faults on the same 64 KiB block in a single frame before
+/// `VICTORY_HOT_GUARD=1` leaves it read-write until the next frame.
+const HOT_FAULTS: u16 = 4;
+
+fn hot_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOT_GUARD").is_some_and(|v| v == "1"))
+}
+
+fn hot_frame_tick(g: &mut Guards) {
+    let frame = crate::frame::current();
+    if g.fault_frame != frame {
+        g.fault_frame = frame;
+        g.faults.clear();
+        g.hot.clear();
+    }
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -708,6 +737,9 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     viewed: BTreeSet::new(),
     verified: BTreeMap::new(),
     holes: BTreeSet::new(),
+    fault_frame: u64::MAX,
+    faults: BTreeMap::new(),
+    hot: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -981,6 +1013,12 @@ unsafe extern "system" {
 /// by anybody, and free memory taken by anybody, with no word to us:
 /// `VirtualQuery` does not tell the three apart, this question does.
 fn placeholder(block: usize) -> bool {
+    // Userspace placeholder fast path: works in ~10ns with zero syscalls on
+    // Windows AND fixes Wine/Proton where NtQueryVirtualMemory class 7
+    // (MemoryRegionInformationEx) is unimplemented and always fails.
+    if crate::inplace::is_placeholder(block.saturating_mul(BLOCK)) {
+        return true;
+    }
     /// `MEMORY_REGION_INFORMATION` (ntddk); only the kinds are read.
     #[repr(C)]
     #[derive(Default)]
@@ -1263,19 +1301,26 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
-    };
+    let known = crate::inplace::is_placeholder(start)
+        || (!*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
+            let g = guards();
+            let first = start / BLOCK;
+            g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+        });
     if !known && !is_view(start, end) {
         return None;
     }
     install();
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // Query userspace placeholder map BEFORE taking GUARDS lock (preserves lock
+    // hierarchy: never take inplace::VIEWS under GUARDS when avoidable).
+    let placeholder_runs = crate::inplace::placeholder_mapped_blocks(first, last);
     let mut g = guards();
+    if hot_guard() {
+        hot_frame_tick(&mut g);
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
@@ -1288,13 +1333,34 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
+    let mut next_run = 0usize;
+    let hot_on = hot_guard();
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
         let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
+        if open && let Some(runs) = placeholder_runs.as_ref() {
+            while next_run < runs.len() && runs[next_run].1 <= block {
+                next_run += 1;
+            }
+            let mapped = next_run < runs.len() && runs[next_run].0 <= block;
+            if !mapped {
+                // Guaranteed unmapped placeholder hole: skip VirtualQuery & VirtualProtect!
+                if g.absent.insert(block) {
+                    // First time seeing this hole: copy as zeros once, like absent.
+                    written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                }
+                if keep != 0 {
+                    g.verified.entry(block).or_insert(now);
+                }
+                open = false;
+            } else if g.absent.remove(&block) {
+                g.verified.remove(&block);
+                forget_hole(&mut g, block);
+            }
+        } else if open && g.absent.contains(&block) {
             // Found uncommitted a moment ago ([`absent_once`]): Windows is
             // not asked again yet. What the runtime maps there it tells,
             // and that takes the block out of `absent` and its note away.
@@ -1327,6 +1393,9 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+            } else if hot_on && g.hot.contains(&block) {
+                // Hot write-faulting block this frame: leave RW until next frame
+                // (not added to `protected`/`clean`, so `PUBLISHED` stays clear).
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -1394,25 +1463,15 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
-    for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
-        let first = (base / BLOCK).max(from);
-        let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
-        for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
-            // One view (nothing else to guard), or the page the title shows
-            // wherever it has nothing (thousands of views): each view of
-            // that one is guarded by itself.
-            if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                continue;
-            }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
-                let alias = alias / BLOCK;
-                g.aliased.insert(alias);
-                if alias != block {
-                    protect_alias(g, alias);
-                }
+    for (page, shown) in crate::inplace::aliased_pages_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
+        let block = page / BLOCK;
+        #[cfg(feature = "diagnostics")]
+        ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for alias in shown {
+            let alias = alias / BLOCK;
+            g.aliased.insert(alias);
+            if alias != block {
+                protect_alias(g, alias);
             }
         }
     }
@@ -1565,17 +1624,46 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    if blocks.is_empty() {
+        return false;
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
         // Before the block can be written ([`PUBLISHED`]; nothing to do
         // where no bit was ever set).
         PUBLISHED.clear(block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
-    !blocks.is_empty()
+    // Coalesce contiguous blocks into one VirtualProtect syscall per run,
+    // falling back to block-by-block if a run spans distinct views.
+    let mut i = 0;
+    while i < blocks.len() {
+        let from = blocks[i];
+        let mut to = from + 1;
+        while i + 1 < blocks.len() && blocks[i + 1] == to {
+            i += 1;
+            to += 1;
+        }
+        let mut old = 0;
+        // SAFETY: blocks we made read-only.
+        let ok = unsafe {
+            VirtualProtect(
+                (from * BLOCK) as *const _,
+                (to - from) * BLOCK,
+                PAGE_READWRITE,
+                &mut old,
+            ) != 0
+        };
+        if !ok && to - from > 1 {
+            for block in from..to {
+                let mut old = 0;
+                // SAFETY: a block we made read-only.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            }
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -1857,6 +1945,15 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1) {
+            if hot_guard() {
+                hot_frame_tick(&mut g);
+                let block = at / BLOCK;
+                let n = g.faults.entry(block).or_insert(0);
+                *n = n.saturating_add(1);
+                if *n >= HOT_FAULTS {
+                    g.hot.insert(block);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);
@@ -1869,9 +1966,10 @@ fn install() {
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
-    // The switch is read here, not first in the handler ([`open`] asks
-    // it): reading the environment allocates.
+    // Switches read in the VEH handler are initialized here so the handler
+    // never reads env vars / allocates on first fault.
     light_kept();
+    hot_guard();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));

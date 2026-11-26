@@ -70,6 +70,18 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// True while `State::early_textures` is running a one-time character
+    /// decoration bake (`PS_BakeDecorations_*`) pass.
+    static BAKE_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether redundant command-list state binds (`OMSetRenderTargets`,
+/// `IASetPrimitiveTopology`, `RSSetViewports`, `RSSetScissorRects`,
+/// `OMSetBlendFactor`, `OMSetStencilRef`, `OMSetDepthBounds`) are skipped when
+/// the host list already has the exact same resolved state (`VICTORY_BIND_CACHE=1`).
+fn bind_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_some_and(|v| v == "1"))
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -361,6 +373,9 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// Last resolved RTV/DSV records bound on this host list, for `VICTORY_BIND_CACHE=1`.
+    bound_rtvs: Vec<(usize, u32, [u32; 6])>,
+    bound_dsv: Option<(usize, u32, [u32; 6])>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -669,6 +684,9 @@ impl State {
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
+        if bind_cache() && self.topology_set && self.topology == topology {
+            return;
+        }
         self.topology = topology;
         self.topology_set = true;
         let host = match topology {
@@ -754,6 +772,31 @@ impl State {
         let Some(host) = crate::host::host() else {
             return;
         };
+        if bind_cache() && self.targets_set {
+            let mut next_rtvs: Vec<(usize, u32, [u32; 6])> = Vec::with_capacity(handles.len());
+            for &h in handles {
+                if let Some(rec) = crate::descriptor::rtv_record(h) {
+                    next_rtvs.push(rec.key());
+                }
+            }
+            let next_dsv = crate::descriptor::dsv_record(depth).map(|rec| rec.key());
+            if next_rtvs == self.bound_rtvs && next_dsv == self.bound_dsv {
+                self.target_handles.clear();
+                self.target_handles.extend_from_slice(handles);
+                self.depth_handle = depth;
+                return;
+            }
+            self.bound_rtvs = next_rtvs;
+            self.bound_dsv = next_dsv;
+        } else if bind_cache() {
+            self.bound_rtvs.clear();
+            for &h in handles {
+                if let Some(rec) = crate::descriptor::rtv_record(h) {
+                    self.bound_rtvs.push(rec.key());
+                }
+            }
+            self.bound_dsv = crate::descriptor::dsv_record(depth).map(|rec| rec.key());
+        }
         self.target_handles.clear();
         self.target_handles.extend_from_slice(handles);
         self.depth_handle = depth;
@@ -815,12 +858,28 @@ impl State {
     /// Viewports, scissors, the blend factor and the stencil reference: set
     /// on the host list at once, and kept for [`State::replay`].
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        if bind_cache()
+            && self.viewports.len() == viewports.len()
+            && self.viewports.iter().zip(viewports).all(|(a, b)| {
+                a.TopLeftX.to_bits() == b.TopLeftX.to_bits()
+                    && a.TopLeftY.to_bits() == b.TopLeftY.to_bits()
+                    && a.Width.to_bits() == b.Width.to_bits()
+                    && a.Height.to_bits() == b.Height.to_bits()
+                    && a.MinDepth.to_bits() == b.MinDepth.to_bits()
+                    && a.MaxDepth.to_bits() == b.MaxDepth.to_bits()
+            })
+        {
+            return;
+        }
         self.viewports.clear();
         self.viewports.extend_from_slice(viewports);
         crate::draw::viewports(list, viewports);
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        if bind_cache() && self.scissors == rects {
+            return;
+        }
         self.scissors.clear();
         self.scissors.extend_from_slice(rects);
         if scissor_test() {
@@ -840,16 +899,33 @@ impl State {
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
-        self.blend = factor.copied();
+        let next = factor.copied();
+        if bind_cache()
+            && let (Some(a), Some(b)) = (self.blend, next)
+            && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+        {
+            return;
+        }
+        self.blend = next;
         crate::draw::blend_factor(list, factor);
     }
 
     pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        if bind_cache() && self.stencil == Some(reference) {
+            return;
+        }
         self.stencil = Some(reference);
         crate::draw::stencil_ref(list, reference);
     }
 
     pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        if bind_cache()
+            && let Some([a, b]) = self.depth_bounds
+            && a.to_bits() == min.to_bits()
+            && b.to_bits() == max.to_bits()
+        {
+            return;
+        }
         self.depth_bounds = Some([min, max]);
         crate::draw::depth_bounds(list, min, max);
     }
@@ -870,10 +946,14 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.bound_rtvs.clear();
+        self.bound_dsv = None;
         if self.topology_set {
+            self.topology_set = false;
             self.set_topology(list, self.topology);
         }
         if self.targets_set {
+            self.targets_set = false;
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
         }
@@ -1750,7 +1830,9 @@ impl State {
         }
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
+        BAKE_PASS.set(bake);
         self.heap_textures(list, heap, host);
+        BAKE_PASS.set(false);
         PASS_BUDGET.set(None);
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -1876,7 +1958,15 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let mut room = crate::resource::room();
+        let is_bake = BAKE_PASS.get();
+        let check_room = || {
+            if is_bake {
+                crate::resource::bake_room()
+            } else {
+                crate::resource::room()
+            }
+        };
+        let mut room = check_room();
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -1893,8 +1983,11 @@ impl State {
             host.texture_slots_room(frame);
         }
         // Slots whose texture's memory the runtime mapped, unmapped or
-        // wrote since the last pass are due again.
-        host.texture_slots_remapped(frame);
+        // wrote since the last pass are due again (immediately during a bake).
+        host.texture_slots_remapped(frame, is_bake);
+        if is_bake {
+            host.texture_slots_bake_prepare(frame);
+        }
         // Levels on demand: the slots of textures whose first level with
         // memory changed since the last pass are made again from it.
         host.texture_views_remade();
@@ -1946,7 +2039,7 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span) = if catchup && room && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -2148,7 +2241,7 @@ impl State {
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
-                room = crate::resource::room();
+                room = check_room();
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
@@ -2281,6 +2374,43 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if self.ambient(list, p) {
+            self.host_heaps = [0; 2];
+            self.host_roots = [0; 2];
+            self.host_pipeline = 0;
+        }
+    }
+
+    /// After a dispatch of `p`: depth-shaded ambient light, if `p` is the
+    /// program that resolves indirect diffuse probes (`crate::ambient`).
+    fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no ambient light: other tables");
+            return false;
+        }
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report

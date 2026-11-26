@@ -369,6 +369,11 @@ impl Spans {
 /// [`REMAPPED`] so that what such writes do is counted by itself.
 static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// Recent DirectStorage page-write ranges retained for the next one-time
+/// character decoration bake (`PS_BakeDecorations_*`) when `VICTORY_PAGE_WRITES`
+/// does not enable continuous slot re-uploads (bit 2).
+static BAKE_PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
 /// Since the start: such ranges kept for a pass; ranges dropped because no
 /// pass took them; slots of placed textures that held bytes of them when a
 /// pass took them; of those, the slots whose texture had been uploaded
@@ -1207,17 +1212,15 @@ impl HostHeap {
 
     /// Takes the ranges of title memory the runtime mapped, unmapped or
     /// wrote since the last call ([`remapped`]) and makes the slots whose
-    /// placed texture lies there due from the next frame (by when a write
-    /// under way has landed): memory that arrived is uploaded, memory that
-    /// went makes the slot null ([`HostHeap::texture_slot_gone`]), and a
-    /// texture streamed into the place of another of the same description
-    /// is uploaded although no descriptor says so. Slots tables read are
-    /// left to their draws. Returns how many slots it made due.
+    /// placed texture lies there due from the next frame (or immediately on
+    /// `frame` when `immediate` is true, e.g. right before a character
+    /// decoration bake). Slots tables read are left to their draws. Returns
+    /// how many slots it made due.
     /// shortcut: the ranges are kept in one place for all heaps; the heap
     /// whose pass runs first takes them (a title has one view heap).
-    pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
+    pub(crate) fn texture_slots_remapped(&self, frame: u64, immediate: bool) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        self.texture_slots_page_written(frame);
+        self.texture_slots_page_written(frame, immediate);
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
@@ -1229,38 +1232,66 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        let due_frame = if immediate { frame } else { frame + 1 };
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
-            textures.changed(slot, frame, frame + 1);
+            textures.changed(slot, frame, due_frame);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
     }
 
+    /// Right before a one-time character decoration bake (`PS_BakeDecorations_*`),
+    /// pull recently-uploaded slots awaiting their first fingerprint recheck
+    /// (`looks <= 1`) and partially-mapped slots (`mapped > 0`) to `due = frame`
+    /// so any skin/hair texture whose bytes landed after its initial zeroed
+    /// upload is re-checked and uploaded before the bake runs.
+    pub(crate) fn texture_slots_bake_prepare(&self, frame: u64) -> usize {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pulled = 0usize;
+        for w in textures.slots.values_mut() {
+            if w.due > frame && ((w.checked.2 != 0 && w.checked.3 <= 1) || w.mapped > 0) {
+                w.due = frame;
+                pulled += 1;
+            }
+        }
+        pulled
+    }
+
     /// Takes the ranges of title memory written behind the guards' back
     /// since the last call ([`page_written`]) and finds the slots whose
-    /// placed texture holds bytes of them ([`Spans::slots_holding`]). A
-    /// slot whose texture was uploaded before the write shows the bytes
-    /// from before: with `VICTORY_PAGE_WRITES` (`crate::watch::page_writes`,
-    /// bit 2) it is due again [`PAGE_WRITE_AFTER`] frames on, as memory
-    /// mapped under it would make it ([`HostHeap::texture_slots_remapped`]);
-    /// its host copy exists, so the upload needs no room on the card. A
-    /// slot still waiting for its first upload is left as it is: that
-    /// upload takes the bytes that are there by then. Slots tables read
-    /// are left to their draws. Counted either way; returns how many slots
-    /// it made due.
-    fn texture_slots_page_written(&self, frame: u64) -> usize {
+    /// placed texture holds bytes of them ([`Spans::slots_holding`]).
+    fn texture_slots_page_written(&self, frame: u64, immediate: bool) -> usize {
         let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        let always_due = crate::watch::page_writes() & 2 != 0;
+        if immediate {
+            let mut retained = std::mem::take(&mut *BAKE_PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+            retained.extend(ranges);
+            if retained.is_empty() {
+                return 0;
+            }
+            return self.slots_written_under(&retained, frame, true, true)[2];
+        }
         if ranges.is_empty() {
             return 0;
         }
-        self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
+        if !always_due {
+            let mut retained = BAKE_PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            const KEEP_MOST: usize = 1 << 14;
+            if retained.len() + ranges.len() > KEEP_MOST {
+                let drop_n = (retained.len() + ranges.len()).saturating_sub(KEEP_MOST);
+                let cut = drop_n.min(retained.len());
+                retained.drain(..cut);
+            }
+            retained.extend(ranges.iter().copied());
+        }
+        self.slots_written_under(&ranges, frame, always_due, false)[2]
     }
 
     /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
     /// the slots that held bytes of them, those of them uploaded before,
     /// and those made due (the latter, if `due`).
-    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool) -> [usize; 3] {
+    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool, immediate: bool) -> [usize; 3] {
         use std::sync::atomic::Ordering::Relaxed;
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
@@ -1279,8 +1310,9 @@ impl HostHeap {
         if !due {
             return [held, slots.len(), 0];
         }
+        let due_frame = if immediate { frame } else { frame + PAGE_WRITE_AFTER };
         for &slot in &slots {
-            textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+            textures.changed(slot, frame, due_frame);
         }
         [held, slots.len(), slots.len()]
     }
@@ -1879,7 +1911,7 @@ impl HostHeap {
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
-        let mut due: Vec<(u32, u64)> = Vec::new();
+        let mut due: Vec<(u32, u64, [u32; 3])> = Vec::new();
         let all_zero = |slice: &[u8]| -> bool {
             let (chunks, rem) = slice.as_chunks::<8>();
             chunks.iter().all(|c| u64::from_ne_bytes(*c) == 0) && rem.iter().all(|&b| b == 0)
@@ -1931,13 +1963,274 @@ impl HostHeap {
                     continue;
                 }
                 *last = print;
-                due.push((index as u32, handle));
+                let words = if record.len() >= 12 {
+                    [
+                        u32::from_le_bytes([record[0], record[1], record[2], record[3]]),
+                        u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
+                        u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
+                    ]
+                } else {
+                    [0; 3]
+                };
+                due.push((index as u32, handle, words));
             }
         }
-        for &(index, handle) in &due {
-            self.mirror(index, handle, false);
+        let mirrored = due.len() as u64;
+        if !due.is_empty() {
+            self.mirror_copied_batch(&due, frame);
         }
-        (looked, due.len() as u64)
+        (looked, mirrored)
+    }
+
+    /// Batched `mirror(index, handle, false)` for all changed slots of one page
+    /// in `mirror_copied_page`. Acquires `made`, `textures`, `placed`, `buffers`,
+    /// `changed`, and `kept` once per page instead of once per slot (cutting
+    /// ~300,000 mutex lock/unlock cycles/frame on busy world frames while
+    /// preserving exact lock order and semantics).
+    fn mirror_copied_batch(&self, due: &[(u32, u64, [u32; 3])], frame: u64) {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        // Pre-filter lock-free against `made_fast` and resolve views using the
+        // concurrent `VIEWS` RwLock before taking any `HostHeap` mutex.
+        let mut resolved: Vec<(u32, u64, u64, Option<View>)> = Vec::with_capacity(due.len());
+        for &(index, handle, [tag, i, generation]) in due {
+            if index >= self.count {
+                continue;
+            }
+            let key = u64::from(generation) << 32 | u64::from(i);
+            if tag == VIEW_TAG
+                && key != 0
+                && self.made_fast[index as usize].load(Acquire) == key
+            {
+                continue;
+            }
+            let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+            resolved.push((index, handle, key, view));
+        }
+        if resolved.is_empty() {
+            return;
+        }
+
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active: Vec<(u32, u64, u64, Option<View>)> = Vec::with_capacity(resolved.len());
+        for (index, handle, key, view) in resolved {
+            match view {
+                None => {
+                    if made[index as usize] != 0 {
+                        active.push((index, handle, 0, None));
+                    }
+                }
+                Some(v) => {
+                    if made[index as usize] != key {
+                        active.push((index, handle, key, Some(v)));
+                    }
+                }
+            }
+        }
+        if active.is_empty() {
+            return;
+        }
+
+        // Batched `note_buffer` for non-sampler heaps, keeping exact lock order:
+        // `made` -> `textures` -> `placed` -> `textures` (stale) -> `buffers` -> `changed` -> `kept`.
+        let mut stale_unmake: Vec<u32> = Vec::new();
+        if !self.sampler {
+            // 1. Batched `queue_texture` (1 lock on `self.textures`).
+            let tabled = tabled_out();
+            let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+            {
+                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                for (index, _, _, view) in &active {
+                    let index = *index;
+                    let texture = match view {
+                        Some(View::Placed(false, resource, _)) if resource[0] != 1 => {
+                            PLACED_TEXTURE_SLOTS.fetch_add(1, Relaxed);
+                            true
+                        }
+                        Some(View::Shader(r, _))
+                            if crate::resource::buffer_bytes(*r as crate::object::This).is_none() =>
+                        {
+                            OBJECT_TEXTURE_SLOTS.fetch_add(1, Relaxed);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if texture {
+                        let stamp = if tabled { self.tabled_stamp(index) } else { 0 };
+                        let lately = stamp != 0
+                            && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= TABLED_FRAMES;
+                        let due_frame = if lately {
+                            TABLED_WRITES[0].fetch_add(1, Relaxed);
+                            frame + TABLED_GRACE
+                        } else {
+                            0
+                        };
+                        textures.written(index, frame, due_frame, false);
+                    } else {
+                        textures.remove(index);
+                    }
+                }
+            }
+
+            // 2. Batched `placed` span tracking (1 lock on `self.placed`).
+            let mut all_stale: Vec<(u32, u32)> = Vec::new();
+            {
+                let rule = stale_rule();
+                let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+                placed.rule = rule;
+                for (index, _, _, view) in &active {
+                    let index = *index;
+                    let placed_view = match view {
+                        Some(View::Placed(false, resource, desc))
+                            if resource[0] != 1 && !self.tabled_lately(index, frame) =>
+                        {
+                            Some((resource, u64::from(desc[10]) | u64::from(desc[11]) << 32, desc[4]))
+                        }
+                        _ => None,
+                    };
+                    let span = placed_view.and_then(|(resource, start, first)| {
+                        Some((start, start.saturating_add(placed.bytes(resource)?), first))
+                    });
+                    match span {
+                        Some((start, end, first)) => {
+                            SPANNED[0].fetch_min(start, Relaxed);
+                            SPANNED[1].fetch_max(end, Relaxed);
+                            let stale = placed.note(index, start, end, true);
+                            placed.shows(index, first);
+                            for s in stale {
+                                if s != index {
+                                    all_stale.push((index, s));
+                                }
+                            }
+                        }
+                        None => placed.forget(index),
+                    }
+                }
+            }
+
+            // 3. Remove stale slots from `self.textures` in one lock.
+            if !all_stale.is_empty() {
+                STALE[0].fetch_add(all_stale.len() as u64, Relaxed);
+                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                for &(writer, slot) in &all_stale {
+                    // Only remove if no later slot in `active` re-queued `slot`
+                    // (active is strictly increasing in slot index).
+                    let overwritten_later = slot > writer
+                        && active.binary_search_by_key(&slot, |a| a.0).is_ok();
+                    if !overwritten_later {
+                        textures.remove(slot);
+                        stale_unmake.push(slot);
+                    }
+                }
+            }
+
+            // 4. Batched `strides`, `buffers`, and `changed` (1 lock each).
+            let mut changed_buf: Vec<u32> = Vec::new();
+            {
+                let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+                for (index, _, _, view) in &active {
+                    let index = *index;
+                    let stride = view.as_ref().and_then(view_stride);
+                    if let Some((_, _, data)) = &self.strides
+                        && index < victory_shader::emit::SLOT_STRIDES_COUNT
+                    {
+                        // SAFETY: inside the mapping; shaders read it while we write.
+                        unsafe {
+                            (*data as *mut u32)
+                                .add(index as usize)
+                                .write_volatile(stride.unwrap_or(0));
+                        }
+                    }
+                    let was = if stride.is_some() {
+                        buffers.insert(index);
+                        true
+                    } else {
+                        buffers.remove(&index)
+                    };
+                    if was {
+                        changed_buf.push(index);
+                    }
+                }
+            }
+            if !changed_buf.is_empty() {
+                let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
+                changed.extend(changed_buf);
+            }
+        }
+
+        // 5. Make descriptors and collect `kept` updates + `made_fast` publishes.
+        let mut keep_updates: Vec<(u32, Option<ID3D12Resource>)> = Vec::with_capacity(active.len() + stale_unmake.len());
+        let mut fast_updates: Vec<(u32, u64)> = Vec::with_capacity(active.len() + stale_unmake.len());
+        let keep_v = keep_views();
+        for (index, handle, key, view) in active {
+            let Some(view) = view else {
+                made[index as usize] = 0;
+                if self.sampler {
+                    self.null_sampler(index);
+                } else {
+                    null_view(self.cpu(index));
+                }
+                keep_updates.push((index, None));
+                fast_updates.push((index, 0));
+                continue;
+            };
+            let waiting = view.waiting_texture();
+            if let Some(texture) = waiting {
+                super::wait_for(texture, handle);
+            }
+            let later = view.is_buffer() || waiting.is_some();
+            if later
+                && keep_v
+                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
+                    .is_some_and(|old| same_placed_texture(&old, &view))
+            {
+                KEPT_VIEWS.fetch_add(1, Relaxed);
+                continue;
+            }
+            let next_key = if later { 0 } else { key };
+            made[index as usize] = next_key;
+            let kept = if later {
+                None
+            } else {
+                make(&view, self.cpu(index))
+            };
+            if kept.is_none() && !self.sampler {
+                null_for(&view, self.cpu(index));
+            }
+            keep_updates.push((index, kept.flatten()));
+            fast_updates.push((index, next_key));
+        }
+
+        // Unmake any stale slots (after `active` so a later slot marking an earlier
+        // slot in the same page stale wins cleanly, matching sequential `mirror`).
+        for slot in stale_unmake {
+            if let Some(old_key) = made.get_mut(slot as usize).map(std::mem::take)
+                && old_key != 0
+            {
+                match view_at(old_key as u32, (old_key >> 32) as u32) {
+                    Some(view) => null_for(&view, self.cpu(slot)),
+                    None => null_view(self.cpu(slot)),
+                }
+                keep_updates.push((slot, None));
+                fast_updates.push((slot, 0));
+            }
+        }
+
+        // 6. Batched `self.kept` update (1 lock for the entire page).
+        if !keep_updates.is_empty() {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            for (index, resource) in keep_updates {
+                if let Some(slot) = kept.get_mut(index as usize)
+                    && let Some(old) = std::mem::replace(slot, resource)
+                {
+                    crate::host::retire(old);
+                }
+            }
+        }
+
+        // Publish `made_fast` keys AFTER descriptors & kept resources are installed.
+        for (index, next_key) in fast_updates {
+            self.made_fast[index as usize].store(next_key, Release);
+        }
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -3500,18 +3793,18 @@ mod tests {
         assert!(heap.note_buffer(1, Some(&view), false).is_empty());
         let written = [(at, at + 0x1000)];
         // Waiting for its first upload: held, not uploaded, nothing done.
-        assert_eq!(heap.slots_written_under(&written, 50, true), [1, 0, 0]);
+        assert_eq!(heap.slots_written_under(&written, 50, true, false), [1, 0, 0]);
         let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
         // Uploaded and out of the queue. Memory elsewhere: nothing.
-        assert_eq!(heap.slots_written_under(&[(at + 0x10_0000, at + 0x10_1000)], 60, true), [0, 0, 0]);
+        assert_eq!(heap.slots_written_under(&[(at + 0x10_0000, at + 0x10_1000)], 60, true, false), [0, 0, 0]);
         // Under it, counted only: it stays out of the queue.
-        assert_eq!(heap.slots_written_under(&written, 60, false), [1, 1, 0]);
+        assert_eq!(heap.slots_written_under(&written, 60, false, false), [1, 1, 0]);
         assert_eq!(slots(u64::MAX), []);
         // Under it, asked for: due two frames on, not before.
-        assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
+        assert_eq!(heap.slots_written_under(&written, 60, true, false), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
     }
@@ -3588,7 +3881,7 @@ mod tests {
         // Memory elsewhere: nothing. Under the texture: due from the next frame.
         remapped((at + 2 * len) as usize, 0x1000);
         remapped(at as usize, 0x1000);
-        assert_eq!(heap.texture_slots_remapped(50), 1);
+        assert_eq!(heap.texture_slots_remapped(50, false), 1);
         assert_eq!(slots(50), []);
         assert_eq!(slots(51), [1]);
         // A wider texture written at the same address: slot 1 is stale.

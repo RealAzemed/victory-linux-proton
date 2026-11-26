@@ -524,6 +524,164 @@ struct Views {
 static VIEWS: std::sync::RwLock<Views> =
     std::sync::RwLock::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
 
+/// Non-overlapping placeholder reservations (`MEM_RESERVE_PLACEHOLDER`) created
+/// by the runtime (`xmem::XMemVirtualAlloc`), mapped as `base -> len`.
+/// Inside a placeholder reservation, pages can ONLY become mapped/committed via
+/// `xmem::map` (which calls `title_memory_remapped` + `title_memory_view`), and
+/// can NEVER be `MEM_WRITE_WATCH`. Knowing these ranges in userspace eliminates
+/// thousands of `GetWriteWatch` / `VirtualQuery` / `NtQueryVirtualMemory` calls
+/// per frame, and makes `VICTORY_LIGHT_REFRESH` hole publishing work on Wine/Proton
+/// where `NtQueryVirtualMemory(MemoryRegionInformationEx)` is unimplemented.
+static PLACEHOLDERS: std::sync::RwLock<BTreeMap<usize, usize>> = std::sync::RwLock::new(BTreeMap::new());
+
+/// `VICTORY_PLACEHOLDER_FAST`: on by default (`=0` disables). Uses runtime
+/// placeholder + view tables in userspace instead of kernel syscalls on
+/// physical-page placeholder memory.
+pub(crate) fn placeholder_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACEHOLDER_FAST").is_none_or(|v| v != "0"))
+}
+
+/// The runtime reserved a placeholder region `[at, at + len)` for physical-page
+/// views (`XMemVirtualAlloc` with `MEM_RESERVE_PLACEHOLDER`).
+pub fn title_memory_placeholder(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut map = PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner());
+    map.insert(at, len);
+}
+
+/// Whether `at` lies inside a runtime physical-page placeholder reservation.
+pub(crate) fn is_placeholder(at: usize) -> bool {
+    if !placeholder_fast() {
+        return false;
+    }
+    let map = PLACEHOLDERS.read().unwrap_or_else(|e| e.into_inner());
+    map.range(..=at)
+        .next_back()
+        .is_some_and(|(&base, &len)| at < base.saturating_add(len))
+}
+
+/// Whether the entire range `[start, end)` lies inside one runtime
+/// physical-page placeholder reservation.
+pub(crate) fn placeholder_range(start: usize, end: usize) -> bool {
+    if !placeholder_fast() || start >= end {
+        return false;
+    }
+    let map = PLACEHOLDERS.read().unwrap_or_else(|e| e.into_inner());
+    map.range(..=start)
+        .next_back()
+        .is_some_and(|(&base, &len)| end <= base.saturating_add(len))
+}
+
+/// If `[start, start + len)` lies inside a runtime placeholder reservation,
+/// returns the exact number of mapped (committed, readable) bytes in it from
+/// the userspace view table — zero syscalls. `None` outside placeholders.
+pub(crate) fn placeholder_mapped_bytes(start: usize, len: usize) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    let end = start.saturating_add(len);
+    if !placeholder_range(start, end) {
+        return None;
+    }
+    let v = views_read();
+    let mut there = 0u64;
+    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
+        && base.saturating_add(bytes) > start
+    {
+        let hi = base.saturating_add(bytes).min(end);
+        there += (hi - start) as u64;
+    }
+    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
+        let hi = base.saturating_add(bytes).min(end);
+        if hi > base {
+            there += (hi - base) as u64;
+        }
+    }
+    Some(there)
+}
+
+/// If 64 KiB block range `[from_block, to_block)` lies inside a runtime
+/// placeholder reservation, returns merged contiguous runs of mapped blocks
+/// `(start_block, end_block)` inside `[from_block, to_block)`. Blocks outside
+/// these runs are guaranteed unmapped placeholder holes.
+pub(crate) fn placeholder_mapped_blocks(from_block: usize, to_block: usize) -> Option<Vec<(usize, usize)>> {
+    if from_block >= to_block {
+        return None;
+    }
+    let start = from_block.checked_mul(K64)?;
+    let end = to_block.checked_mul(K64)?;
+    if !placeholder_range(start, end) {
+        return None;
+    }
+    let v = views_read();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |base: usize, bytes: usize| {
+        let lo = (base / K64).max(from_block);
+        let hi = base.saturating_add(bytes).div_ceil(K64).min(to_block);
+        if lo >= hi {
+            return;
+        }
+        if let Some(last) = runs.last_mut()
+            && lo <= last.1
+        {
+            last.1 = last.1.max(hi);
+        } else {
+            runs.push((lo, hi));
+        }
+    };
+    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
+        && base.saturating_add(bytes) > start
+    {
+        push(base, bytes);
+    }
+    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
+        push(base, bytes);
+    }
+    Some(runs)
+}
+
+/// Single-lock query returning `(page_addr, all_views_of_page)` for every 64 KiB
+/// page in `[start, end)` that has `2..=MANY_VIEWS` views.
+pub(crate) fn aliased_pages_between(start: usize, end: usize) -> Vec<(usize, Vec<usize>)> {
+    if start >= end {
+        return Vec::new();
+    }
+    let v = views_read();
+    let mut out = Vec::new();
+    let mut visit = |base: usize, bytes: usize, section: usize, offset: u64| {
+        let lo = base.max(start) & !(K64 - 1);
+        let hi = base.saturating_add(bytes).min(end).next_multiple_of(K64);
+        let mut page = lo;
+        while page < hi {
+            if page >= base && page < base.saturating_add(bytes) {
+                let within = page - base;
+                if let Some(shown) = v.pages.get(&(section, offset + within as u64))
+                    && shown.len() >= 2
+                    && shown.len() <= crate::watch::MANY_VIEWS
+                {
+                    out.push((page, shown.clone()));
+                }
+            }
+            match page.checked_add(K64) {
+                Some(next) => page = next,
+                None => break,
+            }
+        }
+    };
+    if let Some((&base, &(bytes, section, offset))) = v.views.range(..=start).next_back()
+        && base.saturating_add(bytes) > start
+    {
+        visit(base, bytes, section, offset);
+    }
+    for (&base, &(bytes, section, offset)) in v.views.range(start.saturating_add(1)..end) {
+        visit(base, bytes, section, offset);
+    }
+    out
+}
+
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
     VIEWS.read().unwrap_or_else(|e| e.into_inner())
 }
@@ -606,6 +764,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
 }
 
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.
+#[allow(dead_code)]
 pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     if start >= end {
         return Vec::new();
@@ -1709,5 +1868,37 @@ mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn placeholder_fast_path_tracks_mapped_bytes_and_blocks() {
+        let base = 0x7_6000_0000usize;
+        title_memory_placeholder(base, 8 * K64);
+        assert!(is_placeholder(base));
+        assert!(is_placeholder(base + 8 * K64 - 1));
+        assert!(!is_placeholder(base + 8 * K64));
+        assert!(placeholder_range(base, base + 8 * K64));
+        assert!(!placeholder_range(base, base + 9 * K64));
+        assert_eq!(placeholder_mapped_bytes(base, 8 * K64), Some(0));
+        assert_eq!(placeholder_mapped_blocks(base / K64, base / K64 + 8), Some(vec![]));
+
+        title_memory_view(base + K64, 2 * K64, 88, 0);
+        title_memory_view(base + 5 * K64, K64, 88, 2 * K64 as u64);
+        assert_eq!(placeholder_mapped_bytes(base, 8 * K64), Some(3 * K64 as u64));
+        assert_eq!(
+            placeholder_mapped_bytes(base + K64 + 16, 2 * K64 - 32),
+            Some((2 * K64 - 32) as u64)
+        );
+        assert_eq!(
+            placeholder_mapped_blocks(base / K64, base / K64 + 8),
+            Some(vec![
+                (base / K64 + 1, base / K64 + 3),
+                (base / K64 + 5, base / K64 + 6),
+            ])
+        );
+        assert_eq!(placeholder_mapped_bytes(base + 8 * K64, K64), None);
+
+        views_gone(base, 8 * K64);
+        assert_eq!(placeholder_mapped_bytes(base, 8 * K64), Some(0));
     }
 }

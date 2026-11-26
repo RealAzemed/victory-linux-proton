@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod backreads;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -88,7 +90,8 @@ mod texback;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{
-    title_memory_freeing, title_memory_section, title_memory_section_backing, title_memory_view,
+    title_memory_freeing, title_memory_placeholder, title_memory_section,
+    title_memory_section_backing, title_memory_view,
 };
 #[cfg(windows)]
 pub use watch::{

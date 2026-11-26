@@ -650,7 +650,7 @@ impl Layout {
         } else {
             (dst.len(), src.len())
         };
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
+        if linear_len < need || row_pitch < bytes || (!DETILE && tiled_len < self.size as usize) {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
@@ -670,6 +670,35 @@ impl Layout {
                 }
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
+        }
+        // When detiling from a prefix slice shorter than `self.size` (e.g.
+        // on-demand / mip-capped textures whose larger unheld mips lie past
+        // the prefix), verify the exact highest tiled byte this subresource reads.
+        if DETILE && tiled_len < self.size as usize {
+            let max_col_end = if linear {
+                bytes
+            } else {
+                runs.iter().map(|&(off, _, len)| off + len).max().unwrap_or(0)
+            };
+            let mut max_tiled = 0usize;
+            for z in 0..depth {
+                let (s, inner) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                if linear {
+                    if m.height > 0 {
+                        let last_row = base + u64::from(m.height - 1) * u64::from(m.pitch) * n as u64;
+                        max_tiled = max_tiled.max((last_row as usize).saturating_add(max_col_end));
+                    }
+                } else {
+                    for y in 0..m.height {
+                        let tiled_row = (base + self.row(m, y, inner)) as usize;
+                        max_tiled = max_tiled.max(tiled_row.saturating_add(max_col_end));
+                    }
+                }
+            }
+            if tiled_len < max_tiled {
+                return Err(Error::TooSmall);
+            }
         }
         // A mip can end partway through the last run. Check the other runs
         // once so each row can copy them as fixed-size chunks.

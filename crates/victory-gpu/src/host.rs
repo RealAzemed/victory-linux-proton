@@ -7804,92 +7804,143 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
+    ///
+    /// With `VICTORY_WIDE_TEXTURES` (on by default; `=0` disables), deferred
+    /// texture detiles (`Step::Texture`) within each segment between
+    /// title-memory-writing steps (`Step::Copy`, `Step::Run`) are fanned out
+    /// in parallel across `crate::shadow::wide_run` before running that
+    /// segment's remaining steps in exact order.
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
-            let copied = match step {
-                &Step::Copy(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
+        static WIDE_TEX: OnceLock<bool> = OnceLock::new();
+        let wide_tex = *WIDE_TEX.get_or_init(|| {
+            std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0")
+        });
+        let deferred = self.deferred();
+        let copies = &deferred.copies;
+        let mut seg_start = 0usize;
+        while seg_start < copies.len() {
+            // Find the end of the segment before the next title-memory write
+            // (`Step::Copy` or `Step::Run`), which resets `batch.textures`.
+            let mut seg_end = seg_start;
+            while seg_end < copies.len()
+                && !matches!(copies[seg_end], Step::Copy(..) | Step::Run(..))
+            {
+                seg_end += 1;
+            }
+            if wide_tex && seg_end > seg_start {
+                let mut due: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
+                for step in &copies[seg_start..seg_end] {
+                    if let Step::Texture(staging) = step
+                        && batch.texture_due(staging)
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        due.push(staging.clone());
                     }
-                    batch.title_wrote(dst, len);
-                    #[cfg(feature = "diagnostics")]
-                    fill_check::copy_runs(dst, src, len);
-                    #[cfg(feature = "diagnostics")]
-                    let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    // With the submission's one asking: the journal learns it.
-                    crate::watch::wrote(dst, len);
-                    len
                 }
-                &Step::Fill(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
-                        fill_check::runs(src, len);
-                    }
-                    #[cfg(feature = "diagnostics")]
-                    let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
-                    copy_fill(dst as *mut u8, src as *const u8, len);
-                    len
+                if due.len() >= 2 {
+                    let started = std::time::Instant::now();
+                    let read_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let jobs: Vec<Box<dyn FnOnce() + Send>> = due
+                        .into_iter()
+                        .map(|staging| {
+                            let read_bytes = read_bytes.clone();
+                            Box::new(move || {
+                                let n = staging.refresh_work();
+                                read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            }) as Box<dyn FnOnce() + Send>
+                        })
+                        .collect();
+                    crate::shadow::wide_run(jobs);
+                    PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PREPARING[3].fetch_add(read_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+                } else if let Some(staging) = due.into_iter().next() {
+                    staging.refresh();
                 }
-                Step::Refresh(shadow, address, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Refreshes, 1);
-                        add(C::RefreshBytes, *len as u64);
+            }
+            // Include the terminating `Step::Copy` / `Step::Run` (if any) in
+            // this segment's sequential pass.
+            let run_end = (seg_end + 1).min(copies.len());
+            for step in &copies[seg_start..run_end] {
+                let started = std::time::Instant::now();
+                let copied = match step {
+                    &Step::Copy(dst, src, len) => {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            add(C::Copies, 1);
+                            add(C::CopyBytes, len as u64);
+                        }
+                        batch.title_wrote(dst, len);
+                        #[cfg(feature = "diagnostics")]
+                        fill_check::copy_runs(dst, src, len);
+                        #[cfg(feature = "diagnostics")]
+                        let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                        // With the submission's one asking: the journal learns it.
+                        crate::watch::wrote(dst, len);
+                        len
                     }
-                    batch.add(shadow, *address, *len);
-                    continue;
-                }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                    &Step::Fill(dst, src, len) => {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            add(C::Copies, 1);
+                            add(C::CopyBytes, len as u64);
+                            fill_check::runs(src, len);
+                        }
+                        #[cfg(feature = "diagnostics")]
+                        let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
+                        copy_fill(dst as *mut u8, src as *const u8, len);
+                        len
                     }
-                    work();
-                    // It wrote title memory, where is not known here: the
-                    // submission's one asking ends, later refreshes ask anew.
-                    if matches!(step, Step::Run(_)) {
-                        crate::watch::ask_once_end();
+                    Step::Refresh(shadow, address, len) => {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            add(C::Refreshes, 1);
+                            add(C::RefreshBytes, *len as u64);
+                        }
+                        batch.add(shadow, *address, *len);
+                        continue;
                     }
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                    Step::Run(work) | Step::Host(work) => {
+                        if matches!(step, Step::Run(_)) {
+                            batch.title_written();
+                        }
+                        work();
+                        // It wrote title memory, where is not known here: the
+                        // submission's one asking ends, later refreshes ask anew.
+                        if matches!(step, Step::Run(_)) {
+                            crate::watch::ask_once_end();
+                        }
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            add(C::Runs, 1);
+                            add(C::RunUs, started.elapsed().as_micros() as u64);
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data: this copy's
-                    // pending refresh first. The other copies' wait for
-                    // the next flush of all (flushing all of them at every
-                    // range a dispatch writes made thousands of write-watch
-                    // askings a frame).
-                    batch.flush_one(shadow);
-                    #[cfg(feature = "diagnostics")]
-                    let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::GpuWrites, 1);
-                        add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+                    Step::GpuWrite(shadow, address, len) => {
+                        batch.flush_one(shadow);
+                        #[cfg(feature = "diagnostics")]
+                        let snapshot = std::time::Instant::now();
+                        shadow.writing(*address, *len);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            add(C::GpuWrites, 1);
+                            add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
+                    Step::Texture(staging) => {
+                        if !wide_tex && batch.texture_due(staging) {
+                            staging.refresh();
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
-            preparing(0, started.elapsed().as_micros() as u64);
-            preparing(1, copied as u64);
+                };
+                preparing(0, started.elapsed().as_micros() as u64);
+                preparing(1, copied as u64);
+            }
+            seg_start = run_end;
         }
     }
 }

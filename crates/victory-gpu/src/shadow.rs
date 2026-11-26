@@ -2838,17 +2838,23 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
+    /// Whether this copy is placed directly over title memory (`crate::inplace`).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // The list's prelude takes no record of this copy from here on
         // (`crate::indirect::gather_by_copy`); a copy in place is written
         // by the shaders as any other.
         list.gather_wrote(self.id);
         // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
-        // shortcut: another host copy of the same bytes (a title buffer
-        // inside this one with a copy of its own, a texture in it) is not
-        // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        // compare, and nothing to copy back. When submissions fly ahead
+        // (`VICTORY_LATE_WAIT` / `VICTORY_RELAY`), still declare the written
+        // range on the flight so `line.written` / `line.placed_written` make
+        // any CPU read, copy, wait-for-memory-value, or view remap wait until
+        // the flight finishes (#358).
+        if self.place.is_some() && !crate::host::late() {
             return;
         }
         let len = len.min(self.left(address));
@@ -4127,6 +4133,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n > 0 {
+        crate::host::settle_if_placed_written(at as usize, end as usize);
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }

@@ -179,38 +179,21 @@ pub(crate) fn gone(window: bool, bytes: u64, section: bool) {
     }
 }
 
-/// Whether committed physical-page sections (`SEC_COMMIT`, as `xmem` makes on
-/// Wine/Proton) are opened once via `OpenExistingHeapFromFileMapping` so
-/// contiguous view-memory windows outside buffers are placed directly over the
-/// section with 0 pinned RAM, 0 working-set lock, 0 copies, and 0 guards.
+/// Whether committed anonymous physical-page sections (`SEC_COMMIT`, as `xmem`
+/// makes on Wine/Proton) are opened once via `OpenExistingHeapFromFileMapping`
+/// so contiguous view-memory windows outside buffers are placed directly over
+/// the section with 0 pinned RAM, 0 working-set lock, 0 copies, and 0 guards.
 ///
-/// Opt-in (`VICTORY_INPLACE_SECTIONS=1`) and strictly gated on synchronous
-/// completion (`!VICTORY_LATE_WAIT && !VICTORY_RELAY`): because `Shadow::placed`
-/// skips `Shadow::gpu_writes`, allowing section windows while flights fly ahead
-/// would let the CPU observe stale bytes before a shader write lands (#358).
-/// Also requires a one-time CPU<->GPU aliasing round-trip check
-/// (`section_reads && section_writes && section_outlives_views`) to reject
-/// drivers/wrappers (such as stock libdrm/RADV under vkd3d-proton) where
-/// `OpenExistingHeapFromFileMapping` silently falls back to non-aliasing private
-/// memory while still returning `S_OK`.
+/// Opt-in (`VICTORY_INPLACE_SECTIONS=1`). Shader writes into placed windows are
+/// tracked on flights (`line.written` / `line.placed_written` in `host.rs`) so
+/// `VICTORY_LATE_WAIT` and `VICTORY_RELAY` wait for completion before any CPU
+/// read, copy, memory-value wait, or view remap (#358). Requires a one-time
+/// live CPU<->GPU aliasing round-trip self-test (`section_reads &&
+/// section_writes && section_outlives_views`) and refuses file-backed sections
+/// (`title_memory_section_backing(..., file_backed=true)`).
 pub(crate) fn section_windows_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    level() >= 1
-        && *ON.get_or_init(|| {
-            let asked = std::env::var_os("VICTORY_INPLACE_SECTIONS").is_some_and(|v| v == "1");
-            if !asked {
-                return false;
-            }
-            if crate::host::late() || crate::host::relay() {
-                tracing::warn!(
-                    late = crate::host::late(),
-                    relay = crate::host::relay(),
-                    "VICTORY_INPLACE_SECTIONS=1 refused while VICTORY_LATE_WAIT or VICTORY_RELAY is active: placed windows do not track flight shader writes"
-                );
-                return false;
-            }
-            true
-        })
+    level() >= 1 && *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_SECTIONS").is_some_and(|v| v == "1"))
 }
 
 /// One-time live CPU<->GPU aliasing round-trip verification for
@@ -274,12 +257,12 @@ fn find_section_run(
         .range(..=address)
         .next_back()
         .filter(|&(&b, &(len, _, _))| b.saturating_add(len) > address)?;
-    let (section_bytes, committed) = v
+    let (section_bytes, committed, file_backed) = v
         .sections
         .iter()
         .find(|s| s.0 == section)
-        .map(|s| (s.1, s.2))?;
-    if !committed {
+        .map(|s| (s.1, s.2, s.3))?;
+    if !committed || file_backed {
         return None;
     }
     let mut run_start = base;
@@ -533,8 +516,9 @@ struct Views {
     /// page is a write of the bytes every other view shows
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
-    /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    /// Sections by handle: bytes, whether made committed (`SEC_COMMIT`), and
+    /// whether backed by a regular file rather than anonymous pagefile memory.
+    sections: Vec<(usize, u64, bool, bool)>,
 }
 
 static VIEWS: std::sync::RwLock<Views> =
@@ -548,13 +532,21 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The runtime made a section of `bytes` for physical pages; `committed`
-/// if with `SEC_COMMIT` (only such a section can be opened as a heap).
+/// The runtime made an anonymous pagefile-backed section of `bytes` for
+/// physical pages; `committed` if with `SEC_COMMIT`.
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    title_memory_section_backing(section, bytes, committed, false);
+}
+
+/// As [`title_memory_section`], carrying whether the section is backed by a
+/// regular file (`file_backed=true`, e.g. file-backed scratch mappings).
+/// File-backed sections are kept on the copy path because
+/// `OpenExistingHeapFromFileMapping` can return `S_OK` without aliasing them.
+pub fn title_memory_section_backing(section: usize, bytes: u64, committed: bool, file_backed: bool) {
     {
         let mut v = views_write();
         v.sections.retain(|s| s.0 != section);
-        v.sections.push((section, bytes, committed));
+        v.sections.push((section, bytes, committed, file_backed));
     }
     if let Some(heaps) = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         heaps.remove(&section);
@@ -1405,7 +1397,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    for &(_, bytes, committed, _) in &v.sections {
         lines.push(format!(
             "census, a section of {} MB, {}",
             bytes >> 20,
@@ -1572,7 +1564,11 @@ mod tests {
         let mut v = Views {
             views: BTreeMap::new(),
             pages: BTreeMap::new(),
-            sections: vec![(10, 16 * K64 as u64, true), (20, 16 * K64 as u64, false)],
+            sections: vec![
+                (10, 16 * K64 as u64, true, false),
+                (20, 16 * K64 as u64, false, false),
+                (30, 16 * K64 as u64, true, true),
+            ],
         };
         let cell = 0x7_a000_0000usize;
         let cell_end = cell + (4 << 20);
@@ -1597,9 +1593,11 @@ mod tests {
             find_section_run(&v, tail_start, tail_start + 1, cell, cell_end, true),
             Some((tail_start, 2 * K64, 10, 14 * K64 as u64))
         );
-        // Uncommitted section (SEC_RESERVE) is refused.
+        // Uncommitted section (SEC_RESERVE) and file-backed section are refused.
         v.views.insert(cell + 20 * K64, (2 * K64, 20, 0));
         assert_eq!(find_section_run(&v, cell + 20 * K64, cell + 21 * K64, cell, cell_end, false), None);
+        v.views.insert(cell + 24 * K64, (2 * K64, 30, 0));
+        assert_eq!(find_section_run(&v, cell + 24 * K64, cell + 25 * K64, cell, cell_end, false), None);
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.
